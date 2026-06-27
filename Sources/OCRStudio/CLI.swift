@@ -22,6 +22,15 @@ enum HeadlessCLI {
             return true
         }
 
+        if let i = args.firstIndex(of: "--make-docx"), i + 1 < args.count {
+            let sample = ["Linux_Commands", "systemctl --master-disable",
+                          "This opening paragraph ends like a sentence."]
+            let data = RichTextExport.wordData(from: [sample.joined(separator: "\n")])
+            try? data.write(to: URL(fileURLWithPath: args[i + 1]))
+            print("wrote \(args[i + 1]) (\(data.count) bytes)")
+            return true
+        }
+
         guard let start = args.firstIndex(of: "--ocr") else { return false }
 
         var inputs: [URL] = []

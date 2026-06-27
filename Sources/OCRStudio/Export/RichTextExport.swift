@@ -29,6 +29,14 @@ enum RichTextExport {
         return true
     }
 
+    /// Index of the line in a page that should be the heading/title, or nil.
+    /// Shared by the PDF (font styling) and Word (real Heading 1 style) exporters.
+    static func titleLineIndex(in lines: [String]) -> Int? {
+        guard let idx = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+              looksLikeTitle(lines[idx]) else { return nil }
+        return idx
+    }
+
     /// Build an attributed document from per-page text, styling each page's first
     /// non-empty line as a heading when it looks like a title.
     static func attributed(from pages: [String]) -> NSAttributedString {
@@ -42,21 +50,18 @@ enum RichTextExport {
 
     private static func append(page text: String, to result: NSMutableAttributedString) {
         let lines = text.components(separatedBy: "\n")
-        let titleIndex = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        let promoteTitle = titleIndex.map { looksLikeTitle(lines[$0]) } ?? false
+        let titleIndex = titleLineIndex(in: lines)
 
         for (idx, line) in lines.enumerated() {
             let suffix = idx == lines.count - 1 ? "" : "\n"
-            let attrs = (idx == titleIndex && promoteTitle) ? headingAttributes : bodyAttributes
+            let attrs = idx == titleIndex ? headingAttributes : bodyAttributes
             result.append(NSAttributedString(string: line + suffix, attributes: attrs))
         }
     }
 
-    /// Word .docx data via AppKit's Office Open XML writer.
-    static func wordData(from pages: [String]) throws -> Data {
-        let attr = attributed(from: pages)
-        return try attr.data(from: NSRange(location: 0, length: attr.length),
-                             documentAttributes: [.documentType: NSAttributedString.DocumentType.officeOpenXML])
+    /// Word .docx with a real built-in Heading 1 style on each page's title line.
+    static func wordData(from pages: [String]) -> Data {
+        DocxWriter.data(pages: pages)
     }
 
     /// Render the text into a paginated, selectable PDF (a text document — not the scan).

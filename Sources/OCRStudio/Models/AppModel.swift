@@ -248,7 +248,7 @@ final class AppModel {
         let type = UTType(filenameExtension: "docx") ?? .data
         guard let url = savePanel(suggested: "Document.docx", type: type) else { return }
         runJob("Writing Word document…") {
-            let data = try RichTextExport.wordData(from: self.editedPages)
+            let data = RichTextExport.wordData(from: self.editedPages)
             try data.write(to: url)
             return "Saved \(url.lastPathComponent)"
         }
