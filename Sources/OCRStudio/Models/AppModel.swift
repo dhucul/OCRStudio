@@ -57,6 +57,7 @@ final class AppModel {
 
     // Scan options bound by the UI.
     var scanSource: ScanJobOptions.Source = .flatbed
+    var scanPageSize: ScanJobOptions.PageSize = .letter
     var scanDPI: Int = 300
     var scanColor: Bool = true
     var scanDuplex: Bool = false
@@ -153,6 +154,7 @@ final class AppModel {
     func scan(scannerID: String) {
         var options = ScanJobOptions()
         options.source = scanSource
+        options.pageSize = scanPageSize
         options.dpi = scanDPI
         options.color = scanColor
         options.duplex = scanDuplex

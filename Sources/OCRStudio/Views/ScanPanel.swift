@@ -72,6 +72,11 @@ private struct ScanPanelInner: View {
                 Text("Document Feeder").tag(ScanJobOptions.Source.documentFeeder)
             }
 
+            Picker("Page size", selection: $model.scanPageSize) {
+                ForEach(ScanJobOptions.PageSize.allCases) { Text($0.label).tag($0) }
+            }
+            .help("Feeder/sheet-fed scanners capture at this size; auto-crop trims the margins.")
+
             Picker("Resolution", selection: $model.scanDPI) {
                 ForEach(dpiOptions, id: \.self) { Text("\($0) dpi").tag($0) }
             }

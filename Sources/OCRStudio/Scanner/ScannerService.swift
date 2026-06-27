@@ -6,7 +6,31 @@ import Combine
 /// Options for a scan job.
 struct ScanJobOptions {
     enum Source { case flatbed, documentFeeder }
+
+    /// Page size for document feeders (sheet-fed scanners). The feeder captures at
+    /// this size; a too-small value clips the page, so we default to full width and
+    /// let auto-crop trim any margin.
+    enum PageSize: String, CaseIterable, Identifiable {
+        case letter, a4, legal
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .letter: return "US Letter"
+            case .a4: return "A4"
+            case .legal: return "US Legal"
+            }
+        }
+        var documentType: ICScannerDocumentType {
+            switch self {
+            case .letter: return .typeUSLetter
+            case .a4: return .typeA4
+            case .legal: return .typeUSLegal
+            }
+        }
+    }
+
     var source: Source = .flatbed
+    var pageSize: PageSize = .letter
     var dpi: Int = 300
     var color: Bool = true
     var duplex: Bool = false
@@ -132,10 +156,16 @@ final class ScannerService: NSObject, ObservableObject {
         unit.pixelDataType = options.color ? .RGB : .gray
         unit.bitDepth = .depth8Bits
         unit.measurementUnit = .inches
-        unit.scanArea = CGRect(origin: .zero, size: unit.physicalSize)
 
         if let adf = unit as? ICScannerFunctionalUnitDocumentFeeder {
+            // Sheet-fed: the captured size is governed by documentType, NOT scanArea.
+            // Left unset it defaults small and clips the page, so pick a full-width
+            // size (auto-crop trims any margin afterwards).
+            applyDocumentType(options.pageSize.documentType, to: adf)
             adf.duplexScanningEnabled = options.duplex && adf.supportsDuplexScanning
+        } else {
+            // Flatbed: scan the whole bed.
+            unit.scanArea = CGRect(origin: .zero, size: unit.physicalSize)
         }
 
         scanner.transferMode = .fileBased
@@ -145,6 +175,18 @@ final class ScannerService: NSObject, ObservableObject {
 
         statusMessage = "Scanning…"
         scanner.requestScan()
+    }
+
+    /// Set the feeder's document type to the desired size, falling back through
+    /// common full-width sizes to whatever the scanner actually supports.
+    private func applyDocumentType(_ desired: ICScannerDocumentType,
+                                   to adf: ICScannerFunctionalUnitDocumentFeeder) {
+        let supported = adf.supportedDocumentTypes
+        for candidate in [desired, .typeUSLegal, .typeUSLetter, .typeA4]
+        where supported.contains(Int(candidate.rawValue)) {
+            adf.documentType = candidate
+            return
+        }
     }
 }
 
@@ -222,14 +264,15 @@ extension ScannerService: ICScannerDeviceDelegate {
     func scannerDeviceDidBecomeAvailable(_ scanner: ICScannerDevice) {
         guard let options = pendingOptions else { return }
 
-        var type: ICScannerFunctionalUnitType = options.source == .documentFeeder
-            ? .documentFeeder : .flatbed
-
-        // Fall back to flatbed if the requested unit isn't present.
-        let available = scanner.availableFunctionalUnitTypes.map { $0.uintValue }
-        if !available.contains(type.rawValue) {
-            type = .flatbed
+        let available = scanner.availableFunctionalUnitTypes.compactMap {
+            ICScannerFunctionalUnitType(rawValue: $0.uintValue)
         }
+        let requested: ICScannerFunctionalUnitType =
+            options.source == .documentFeeder ? .documentFeeder : .flatbed
+        // Use the requested unit if present, else whatever the scanner actually has
+        // (e.g. a feeder-only document scanner has no flatbed).
+        let type = available.contains(requested) ? requested : (available.first ?? requested)
+
         statusMessage = "Preparing scanner…"
         scanner.requestSelect(type)
     }

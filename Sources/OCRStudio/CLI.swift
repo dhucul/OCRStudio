@@ -17,6 +17,11 @@ enum HeadlessCLI {
             return true
         }
 
+        if args.contains("--scanner-info") {
+            ScannerInspector.run()
+            return true
+        }
+
         guard let start = args.firstIndex(of: "--ocr") else { return false }
 
         var inputs: [URL] = []
@@ -128,4 +133,76 @@ final class ScannerLister: NSObject, ICDeviceBrowserDelegate {
     }
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {}
+}
+
+/// Opens the first scanner, selects the flatbed, and prints its geometry
+/// (physical size, default scan area, supported resolutions) so we can see why
+/// scans come out clipped/wrong-sized. Times out so it never hangs.
+final class ScannerInspector: NSObject, ICDeviceBrowserDelegate, ICScannerDeviceDelegate {
+    private let browser = ICDeviceBrowser()
+    private var scanner: ICScannerDevice?
+    private var done = false
+
+    static func run() {
+        let insp = ScannerInspector()
+        insp.browser.delegate = insp
+        insp.browser.browsedDeviceTypeMask = ScannerService.scannerBrowseMask
+        print("Looking for a scanner (15s)…")
+        insp.browser.start()
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline && !insp.done {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+        }
+        if !insp.done { print("Timed out — no scanner, or a session couldn't be opened from the CLI.") }
+        insp.browser.stop()
+    }
+
+    func deviceBrowser(_ b: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
+        guard scanner == nil, let s = device as? ICScannerDevice else { return }
+        scanner = s
+        print("Found: \(s.name ?? "?")  transport: \(s.transportType ?? "?")")
+        s.delegate = self
+        s.requestOpenSession()
+    }
+    func deviceBrowser(_ b: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {}
+    func didRemove(_ device: ICDevice) {}
+    func device(_ device: ICDevice, didEncounterError error: Error?) {
+        print("device error: \(error?.localizedDescription ?? "?")")
+    }
+    func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
+        if let error { print("open-session error: \(error.localizedDescription)"); done = true }
+        else { print("session opened; waiting for available…") }
+    }
+    func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {}
+
+    func scannerDeviceDidBecomeAvailable(_ s: ICScannerDevice) {
+        let types = s.availableFunctionalUnitTypes.map { $0.intValue }
+        print("available functional unit types: \(types)  (0=flatbed, 3=feeder)")
+        // Select whatever the device actually has (this one is feeder-only).
+        let t = ICScannerFunctionalUnitType(rawValue: types.first.map(UInt.init) ?? 0) ?? .flatbed
+        s.requestSelect(t)
+    }
+    func scannerDevice(_ s: ICScannerDevice, didSelect unit: ICScannerFunctionalUnit, error: Error?) {
+        if let error { print("select error: \(error.localizedDescription)"); done = true; return }
+        unit.measurementUnit = .inches
+        print("--- unit geometry ---")
+        print("unit.type:              \(unit.type.rawValue)")
+        print("physicalSize (inches):  \(unit.physicalSize)")
+
+        if let adf = unit as? ICScannerFunctionalUnitDocumentFeeder {
+            print("documentType (before): \(adf.documentType.rawValue)")
+            print("documentSize (before): \(adf.documentSize.width) x \(adf.documentSize.height) in")
+            let supported = adf.supportedDocumentTypes
+            print("USLetter supported: \(supported.contains(Int(ICScannerDocumentType.typeUSLetter.rawValue)))  "
+                  + "A4: \(supported.contains(Int(ICScannerDocumentType.typeA4.rawValue)))  "
+                  + "Legal: \(supported.contains(Int(ICScannerDocumentType.typeUSLegal.rawValue)))")
+            adf.documentType = .typeUSLetter
+            print("documentType (after):  \(adf.documentType.rawValue)  (3 = USLetter)")
+            print("documentSize (after):  \(adf.documentSize.width) x \(adf.documentSize.height) in  <-- should be ~8.5 x 11")
+        } else {
+            print("scanArea (default):     \(unit.scanArea)")
+        }
+        s.requestCloseSession()
+        done = true
+    }
 }
