@@ -41,6 +41,32 @@ private struct ScanPanelInner: View {
                 .help("Refresh scanner list")
             }
 
+            if scanner.scanners.isEmpty {
+                noScannerHint
+            } else {
+                nativeScanControls
+            }
+
+            if model.epsonScannerAppURL != nil {
+                Divider()
+                epsonFallback
+            }
+
+            Text(scanner.statusMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        }
+        .padding(12)
+        .onChange(of: scanner.scanners.map(\.id)) { _, ids in
+            if selectedScanner.isEmpty, let first = ids.first { selectedScanner = first }
+        }
+    }
+
+    // MARK: Native (ImageCaptureCore) scan controls
+
+    private var nativeScanControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Picker("Source", selection: $model.scanSource) {
                 Text("Flatbed").tag(ScanJobOptions.Source.flatbed)
                 Text("Document Feeder").tag(ScanJobOptions.Source.documentFeeder)
@@ -63,16 +89,62 @@ private struct ScanPanelInner: View {
             }
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
-            .disabled(scanner.scanners.isEmpty || scanner.isScanning || model.isBusy)
+            .disabled(scanner.isScanning || model.isBusy)
+        }
+    }
 
-            Text(scanner.statusMessage)
+    // MARK: Hint shown when macOS/ICA can't see any scanner
+
+    private var noScannerHint: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("macOS doesn't see a scanner", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout)
+                .foregroundStyle(.orange)
+            Text("If Epson's software detects your scanner but macOS doesn't, scan with Epson below and save into a **Watch Folder** (Settings ▸ Output) — OCR Studio will auto-OCR every file dropped there.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(12)
-        .onChange(of: scanner.scanners.map(\.id)) { _, ids in
-            if selectedScanner.isEmpty, let first = ids.first { selectedScanner = first }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.12)))
+    }
+
+    // MARK: Epson-software fallback
+
+    private var epsonButton: some View {
+        Button {
+            model.launchEpsonScanner()
+        } label: {
+            Label("Scan with Epson…", systemImage: "arrow.up.forward.app")
+                .frame(maxWidth: .infinity)
+        }
+        .controlSize(.large)
+    }
+
+    private var epsonFallback: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Prominent when it's the only way to scan; secondary otherwise.
+            if scanner.scanners.isEmpty {
+                epsonButton.buttonStyle(.borderedProminent)
+            } else {
+                epsonButton.buttonStyle(.bordered)
+            }
+
+            Button {
+                model.toggleWatch()
+            } label: {
+                Label(model.isWatching ? "Stop Watching Folder" : "Start Watching Folder",
+                      systemImage: model.isWatching ? "eye.fill" : "eye")
+                    .frame(maxWidth: .infinity)
+            }
+
+            Text(model.isWatching
+                 ? "Watching for new scans…"
+                 : "Set a Watch Folder in Settings, then save Epson scans there.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

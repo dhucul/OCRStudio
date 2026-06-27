@@ -127,6 +127,26 @@ final class AppModel {
 
     func startBrowsing() { scanner.startBrowsing() }
 
+    /// Epson's own scanning app, if installed (ScanSmart preferred — it scans
+    /// straight to a file). Used as a fallback when macOS/ImageCaptureCore can't
+    /// see the scanner but Epson's proprietary driver can.
+    var epsonScannerAppURL: URL? {
+        ["/Applications/Epson Software/Epson ScanSmart.app",
+         "/Applications/Epson Software/Epson Scan 2.app"]
+            .map { URL(fileURLWithPath: $0) }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    func launchEpsonScanner() {
+        guard let url = epsonScannerAppURL else {
+            status = "Epson scanning software not found in /Applications/Epson Software"
+            return
+        }
+        NSWorkspace.shared.open(url)
+        let name = url.deletingPathExtension().lastPathComponent
+        status = "Opened \(name) — save scans into your Watch Folder to auto-OCR them"
+    }
+
     func scan(scannerID: String) {
         var options = ScanJobOptions()
         options.source = scanSource

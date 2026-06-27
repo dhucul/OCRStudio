@@ -92,6 +92,23 @@ Architecture (see `Sources/OCRStudio/`):
 Coordinate spaces (Vision normalized/bottom-left ↔ image pixels/top-left ↔ PDF
 points/bottom-left) are all converted in one place: `Models/Geometry.swift`.
 
+## Scanner compatibility
+
+The in-app **Scan** button uses Apple's ImageCaptureCore — the same engine as
+Apple's *Image Capture* app. Some scanners (notably many Epson units) are only
+reachable through Epson's proprietary driver and never appear to that framework.
+Quick test: if *Image Capture* (in `/Applications`) doesn't list your scanner,
+OCR Studio's native scan can't see it either. Diagnose with:
+
+```bash
+.build/debug/OCRStudio --list-scanners
+```
+
+When macOS can't see the scanner, use the **Epson fallback** the app surfaces:
+press **Scan with Epson…** (launches Epson ScanSmart / Scan 2), save scans into a
+**Watch Folder** (Settings ▸ Output), and OCR Studio auto-OCRs each one into a
+searchable `…-ocr.pdf` + text sidecar.
+
 ## Notes & limitations
 
 - The live scanner path requires the Epson powered on and not held open by Epson
