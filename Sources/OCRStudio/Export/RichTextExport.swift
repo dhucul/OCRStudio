@@ -7,15 +7,49 @@ import Foundation
 /// clean paginated text PDF. These use the edited text, not the scanned image.
 enum RichTextExport {
 
-    /// Build a simple attributed document from per-page text (pages separated by a blank line).
+    private static var bodyAttributes: [NSAttributedString.Key: Any] {
+        let p = NSMutableParagraphStyle()
+        p.lineSpacing = 2
+        return [.font: NSFont.systemFont(ofSize: 12), .paragraphStyle: p]
+    }
+
+    private static var headingAttributes: [NSAttributedString.Key: Any] {
+        let p = NSMutableParagraphStyle()
+        p.lineSpacing = 2
+        p.paragraphSpacing = 8
+        return [.font: NSFont.boldSystemFont(ofSize: 18), .paragraphStyle: p]
+    }
+
+    /// A line counts as a title if it's short and doesn't read like a sentence,
+    /// so a document that opens with a paragraph isn't mistakenly promoted.
+    private static func looksLikeTitle(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, t.count <= 60 else { return false }
+        if let last = t.last, ".,:;".contains(last) { return false }
+        return true
+    }
+
+    /// Build an attributed document from per-page text, styling each page's first
+    /// non-empty line as a heading when it looks like a title.
     static func attributed(from pages: [String]) -> NSAttributedString {
-        let body = pages.joined(separator: "\n\n")
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 2
-        return NSAttributedString(string: body, attributes: [
-            .font: NSFont.systemFont(ofSize: 12),
-            .paragraphStyle: paragraph
-        ])
+        let result = NSMutableAttributedString()
+        for (i, page) in pages.enumerated() {
+            if i > 0 { result.append(NSAttributedString(string: "\n\n", attributes: bodyAttributes)) }
+            append(page: page, to: result)
+        }
+        return result
+    }
+
+    private static func append(page text: String, to result: NSMutableAttributedString) {
+        let lines = text.components(separatedBy: "\n")
+        let titleIndex = lines.firstIndex { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let promoteTitle = titleIndex.map { looksLikeTitle(lines[$0]) } ?? false
+
+        for (idx, line) in lines.enumerated() {
+            let suffix = idx == lines.count - 1 ? "" : "\n"
+            let attrs = (idx == titleIndex && promoteTitle) ? headingAttributes : bodyAttributes
+            result.append(NSAttributedString(string: line + suffix, attributes: attrs))
+        }
     }
 
     /// Word .docx data via AppKit's Office Open XML writer.
