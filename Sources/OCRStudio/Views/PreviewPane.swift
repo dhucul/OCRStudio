@@ -77,41 +77,47 @@ private struct ImageWithBoxes: View {
 }
 
 private struct TextInspector: View {
-    let page: PageVM
+    @Bindable var page: PageVM
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Recognized Text").font(.headline)
-
-            if let ocr = page.ocr {
-                if let c = ocr.averageConfidence {
-                    Text("Average confidence: \(Int(c * 100))%")
+            HStack {
+                Text("Recognized Text").font(.headline)
+                Spacer()
+                if let c = page.ocr?.averageConfidence {
+                    Text("\(Int(c * 100))%")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .help("Average OCR confidence")
                 }
-
-                ScrollView {
-                    Text(ocr.fullText.isEmpty ? "— no text recognized —" : ocr.fullText)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .font(.system(.body, design: .default))
+                Button {
+                    page.editedText = page.ocr?.fullText ?? ""
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
                 }
+                .buttonStyle(.borderless)
+                .help("Revert edits to the recognized text")
+                .disabled(page.editedText == (page.ocr?.fullText ?? ""))
+            }
 
-                if !ocr.barcodes.isEmpty {
-                    Divider()
-                    Text("Barcodes").font(.headline)
-                    ForEach(Array(ocr.barcodes.enumerated()), id: \.offset) { _, code in
-                        VStack(alignment: .leading) {
-                            Text(code.symbology).font(.caption).foregroundStyle(.secondary)
-                            Text(code.payload).textSelection(.enabled)
-                        }
+            Text("Edit below — your changes are used by the Word / PDF / Text exports.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            TextEditor(text: $page.editedText)
+                .font(.system(.body))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
+
+            if let barcodes = page.ocr?.barcodes, !barcodes.isEmpty {
+                Text("Barcodes").font(.headline)
+                ForEach(Array(barcodes.enumerated()), id: \.offset) { _, code in
+                    VStack(alignment: .leading) {
+                        Text(code.symbology).font(.caption).foregroundStyle(.secondary)
+                        Text(code.payload).textSelection(.enabled)
                     }
                 }
-            } else {
-                Text("This page has not been recognized yet.")
-                    .foregroundStyle(.secondary)
             }
-            Spacer()
         }
         .padding(12)
     }

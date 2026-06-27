@@ -31,10 +31,16 @@ struct ContentView: View {
             .disabled(!model.hasPages || model.isBusy)
 
             Menu {
-                Button("Searchable PDF…") { model.exportSearchablePDF() }
-                Button("Plain Text…") { model.exportText() }
-                Button("Markdown…") { model.exportMarkdown() }
-                Button("JSON (boxes)…") { model.exportJSON() }
+                Section("Edited text") {
+                    Button("Word Document (.docx)…") { model.exportWord() }
+                    Button("PDF (text)…") { model.exportTextPDF() }
+                    Button("Plain Text (.txt)…") { model.exportText() }
+                }
+                Section("From scan") {
+                    Button("Searchable PDF (scan + text)…") { model.exportSearchablePDF() }
+                    Button("Markdown…") { model.exportMarkdown() }
+                    Button("JSON (boxes)…") { model.exportJSON() }
+                }
             } label: {
                 Label("Export", systemImage: "square.and.arrow.up")
             }

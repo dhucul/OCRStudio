@@ -12,8 +12,14 @@ final class PageVM: Identifiable {
     var image: SendableImage           // image OCR ran on (display + box + PDF source)
     var dpi: Double
     var sourceName: String
-    var ocr: OCRPageResult?
     var cropToContent: Bool            // re-apply content crop on re-run (scanned pages)
+
+    /// Recognized text — replaced whenever OCR (re)runs. Edits flow into editedText.
+    var ocr: OCRPageResult? {
+        didSet { editedText = ocr?.fullText ?? "" }
+    }
+    /// User-editable text shown/edited in the inspector and used by text exports.
+    var editedText: String = ""
 
     init(originalImage: SendableImage, image: SendableImage, dpi: Double,
          sourceName: String, ocr: OCRPageResult?, cropToContent: Bool) {
@@ -23,6 +29,7 @@ final class PageVM: Identifiable {
         self.sourceName = sourceName
         self.ocr = ocr
         self.cropToContent = cropToContent
+        self.editedText = ocr?.fullText ?? ""   // didSet doesn't fire from init
     }
 
     convenience init(_ p: ProcessedPage) {
@@ -234,9 +241,30 @@ final class AppModel {
         }
     }
 
+    /// Per-page edited text (reflects the user's corrections in the inspector).
+    var editedPages: [String] { pages.map(\.editedText) }
+
+    func exportWord() {
+        let type = UTType(filenameExtension: "docx") ?? .data
+        guard let url = savePanel(suggested: "Document.docx", type: type) else { return }
+        runJob("Writing Word document…") {
+            let data = try RichTextExport.wordData(from: self.editedPages)
+            try data.write(to: url)
+            return "Saved \(url.lastPathComponent)"
+        }
+    }
+
+    func exportTextPDF() {
+        guard let url = savePanel(suggested: "Document.pdf", type: .pdf) else { return }
+        runJob("Writing PDF…") {
+            try RichTextExport.writeTextPDF(pages: self.editedPages, to: url)
+            return "Saved \(url.lastPathComponent)"
+        }
+    }
+
     func exportText() {
-        guard let url = savePanel(suggested: "Scan.txt", type: .plainText) else { return }
-        writeString(Exporters.plainText(ocrResults), to: url)
+        guard let url = savePanel(suggested: "Document.txt", type: .plainText) else { return }
+        writeString(editedPages.joined(separator: "\n\n\u{000C}\n"), to: url)
     }
 
     func exportMarkdown() {
