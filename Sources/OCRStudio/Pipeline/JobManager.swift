@@ -114,6 +114,34 @@ actor JobManager {
         return (SendableImage(cgImage: cropped), adjusted)
     }
 
+    /// A page is blank when OCR found no text or barcodes AND it has almost no ink
+    /// (so a text page or a figure-only page is never mistaken for blank).
+    func isBlankPage(_ page: ProcessedPage) -> Bool {
+        let hasText = page.ocr.lines.contains {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if hasText || !page.ocr.barcodes.isEmpty { return false }
+        return Self.inkCoverage(page.image.cgImage) < 0.004   // < 0.4% dark pixels
+    }
+
+    /// Fraction of dark ("ink") pixels in a downsampled grayscale copy of the image.
+    private static func inkCoverage(_ cg: CGImage) -> Double {
+        let maxDim = 600
+        let scale = min(1.0, Double(maxDim) / Double(max(cg.width, cg.height)))
+        let w = max(1, Int(Double(cg.width) * scale))
+        let h = max(1, Int(Double(cg.height) * scale))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return 1.0 }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else { return 1.0 }
+
+        let ptr = data.bindMemory(to: UInt8.self, capacity: w * h)
+        var dark = 0
+        for i in 0..<(w * h) where ptr[i] < 180 { dark += 1 }
+        return Double(dark) / Double(w * h)
+    }
+
     private func shouldOCR(_ page: IngestedPage, policy: TextLayerPolicy) -> Bool {
         guard page.hasTextLayer else { return true }   // image-only page → always OCR
         switch policy {

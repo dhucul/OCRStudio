@@ -30,6 +30,7 @@ struct Settings: Codable, Sendable {
 
     // Scanned-page handling
     var autoCropScannedPages: Bool = true  // trim empty scanner-bed margins, centering content
+    var skipBlankPages: Bool = true        // drop blank feeder pages (e.g. duplex backs)
 
     // Ingest / rasterization
     var rasterDPI: Double = 200

@@ -181,16 +181,24 @@ final class AppModel {
             self.status = "Recognizing \(scannedURLs.count) scanned page(s)…"
             Task { [settings = self.settings] in
                 var newPages: [PageVM] = []
+                var blanks = 0
                 for url in scannedURLs {
                     let processed = await self.jobs.process(
                         url: url, settings: settings,
                         cropToContent: settings.autoCropScannedPages)
-                    newPages.append(contentsOf: processed.map(PageVM.init))
+                    for page in processed {
+                        if settings.skipBlankPages, await self.jobs.isBlankPage(page) {
+                            blanks += 1
+                        } else {
+                            newPages.append(PageVM(page))
+                        }
+                    }
                 }
                 self.pages.append(contentsOf: newPages)
                 if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
                 self.isBusy = false
                 self.status = "Scanned \(newPages.count) page(s)"
+                    + (blanks > 0 ? " · skipped \(blanks) blank" : "")
             }
         })
     }

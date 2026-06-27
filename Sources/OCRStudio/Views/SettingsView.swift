@@ -25,6 +25,8 @@ struct SettingsView: View {
             Form {
                 Toggle("Auto-center scanned pages (trim scanner-bed margins)",
                        isOn: $model.settings.autoCropScannedPages)
+                Toggle("Skip blank pages from the feeder (e.g. duplex backs)",
+                       isOn: $model.settings.skipBlankPages)
                 Toggle("Auto-crop & deskew (photographed docs)",
                        isOn: $model.settings.autoCropDeskew)
                 Toggle("Enhance contrast", isOn: $model.settings.enhanceContrast)

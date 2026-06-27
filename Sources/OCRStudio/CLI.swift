@@ -22,6 +22,22 @@ enum HeadlessCLI {
             return true
         }
 
+        if let i = args.firstIndex(of: "--ink"), i + 1 < args.count {
+            let url = URL(fileURLWithPath: args[i + 1])
+            let semaphore = DispatchSemaphore(value: 0)
+            Task {
+                let jobs = JobManager()
+                let pages = await jobs.process(url: url, settings: Settings(), cropToContent: false)
+                for p in pages {
+                    let blank = await jobs.isBlankPage(p)
+                    print("\(url.lastPathComponent): blank=\(blank)  lines=\(p.ocr.lines.count)")
+                }
+                semaphore.signal()
+            }
+            semaphore.wait()
+            return true
+        }
+
         if let i = args.firstIndex(of: "--make-docx"), i + 1 < args.count {
             let sample = ["Linux_Commands", "systemctl --master-disable",
                           "This opening paragraph ends like a sentence."]
