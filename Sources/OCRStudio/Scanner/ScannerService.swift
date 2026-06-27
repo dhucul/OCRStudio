@@ -48,9 +48,20 @@ final class ScannerService: NSObject, ObservableObject {
         try? FileManager.default.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
 
         browser.delegate = self
-        browser.browsedDeviceTypeMask = ICDeviceTypeMask(
-            rawValue: ICDeviceTypeMask.scanner.rawValue | ICDeviceLocationTypeMask.local.rawValue
-        ) ?? .scanner
+        browser.browsedDeviceTypeMask = Self.scannerBrowseMask
+    }
+
+    /// Browse for scanners in **every** location — locally attached (USB/TB),
+    /// network/Bonjour (WiFi Epson units), shared, Bluetooth, and remote.
+    /// Restricting to `.local` misses network scanners, which is the common case.
+    static var scannerBrowseMask: ICDeviceTypeMask {
+        let raw = ICDeviceTypeMask.scanner.rawValue
+            | ICDeviceLocationTypeMask.local.rawValue
+            | ICDeviceLocationTypeMask.shared.rawValue
+            | ICDeviceLocationTypeMask.bonjour.rawValue
+            | ICDeviceLocationTypeMask.bluetooth.rawValue
+            | ICDeviceLocationTypeMask.remote.rawValue
+        return ICDeviceTypeMask(rawValue: raw) ?? .scanner
     }
 
     // MARK: Discovery
