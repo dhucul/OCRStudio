@@ -28,6 +28,13 @@ cp "$BUILD_DIR/$BIN_NAME" "$APP_DIR/Contents/MacOS/$BIN_NAME"
 cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
 
+# App icon (regenerate if missing).
+if [ ! -f "$ROOT/Resources/AppIcon.icns" ]; then
+  echo "==> Generating app icon…"
+  ( cd "$ROOT" && swift scripts/make-icon.swift Resources/AppIcon.icns )
+fi
+cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+
 IDENTITY="-"
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "OCR Studio Local"; then
   IDENTITY="OCR Studio Local"
