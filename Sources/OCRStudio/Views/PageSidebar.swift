@@ -19,6 +19,9 @@ struct PageSidebar: View {
             .onDelete { offsets in model.deletePages(atOffsets: offsets) }
         }
         .listStyle(.sidebar)
+        .onDeleteCommand {
+            if let id = model.selectedPageID { model.deletePage(id) }
+        }
         .overlay {
             if model.pages.isEmpty {
                 Text("No pages yet.\nScan or open files to begin.\n\nScan several sheets, then Save PDF\nto combine them into one document.")

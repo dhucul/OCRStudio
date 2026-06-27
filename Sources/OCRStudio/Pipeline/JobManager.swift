@@ -77,8 +77,13 @@ actor JobManager {
     /// No-ops when there's no text or the content already (nearly) fills the page.
     private func contentCropped(image: SendableImage,
                                 result: OCRPageResult) -> (SendableImage, OCRPageResult) {
-        let boxes = result.lines.map(\.box).filter { $0.width > 0 && $0.height > 0 }
-                  + result.barcodes.map(\.box)
+        // Only confident text drives the crop bounds, so a stray low-confidence
+        // speck (edge mark, hole punch) can't blow up or de-center the crop. All
+        // recognized text is still kept in the result.
+        let textBoxes = result.lines
+            .filter { $0.confidence >= 0.3 && $0.box.width > 0 && $0.box.height > 0 }
+            .map(\.box)
+        let boxes = textBoxes + result.barcodes.map(\.box)
         guard let first = boxes.first else { return (image, result) }
 
         let w = CGFloat(image.width), h = CGFloat(image.height)

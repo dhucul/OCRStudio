@@ -40,10 +40,15 @@ enum DocxWriter {
     }
 
     private static func escape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-         .replacingOccurrences(of: "<", with: "&lt;")
-         .replacingOccurrences(of: ">", with: "&gt;")
-         .replacingOccurrences(of: "\"", with: "&quot;")
+        // Drop characters not permitted in XML 1.0 (control chars other than
+        // tab/newline/CR) so odd pasted input can't produce an unopenable file.
+        let cleaned = String(String.UnicodeScalarView(
+            s.unicodeScalars.filter { $0.value == 9 || $0.value == 10 || $0.value == 13 || $0.value >= 32 }))
+        return cleaned
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
     // MARK: Fixed package parts
