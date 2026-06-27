@@ -30,6 +30,13 @@ struct ContentView: View {
             }
             .disabled(!model.hasPages || model.isBusy)
 
+            Button { model.exportSearchablePDF() } label: {
+                Label("Save PDF", systemImage: "doc.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .help("Combine all \(model.pages.count) page(s) into one searchable PDF")
+            .disabled(!model.hasPages || model.isBusy)
+
             Menu {
                 Section("Edited text") {
                     Button("Word Document (.docx)…") { model.exportWord() }

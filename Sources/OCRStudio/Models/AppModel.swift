@@ -288,6 +288,23 @@ final class AppModel {
         status = "Cleared"
     }
 
+    // MARK: Page management (batch curation)
+
+    func deletePage(_ id: PageVM.ID) {
+        pages.removeAll { $0.id == id }
+        if selectedPageID == id { selectedPageID = pages.first?.id }
+    }
+
+    func deletePages(atOffsets offsets: IndexSet) {
+        let removed = Set(offsets.map { pages[$0].id })
+        pages.remove(atOffsets: offsets)
+        if let sel = selectedPageID, removed.contains(sel) { selectedPageID = pages.first?.id }
+    }
+
+    func movePages(fromOffsets: IndexSet, toOffset: Int) {
+        pages.move(fromOffsets: fromOffsets, toOffset: toOffset)
+    }
+
     // MARK: Helpers
 
     private func writeString(_ string: String, to url: URL) {
