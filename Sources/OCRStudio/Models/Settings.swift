@@ -28,6 +28,9 @@ struct Settings: Codable, Sendable {
     var denoise: Bool = true
     var grayscale: Bool = false
 
+    // Scanned-page handling
+    var autoCropScannedPages: Bool = true  // trim empty scanner-bed margins, centering content
+
     // Ingest / rasterization
     var rasterDPI: Double = 200
     var textLayerPolicy: TextLayerPolicy = .ocrIfSparse

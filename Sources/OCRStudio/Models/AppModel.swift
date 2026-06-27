@@ -13,19 +13,21 @@ final class PageVM: Identifiable {
     var dpi: Double
     var sourceName: String
     var ocr: OCRPageResult?
+    var cropToContent: Bool            // re-apply content crop on re-run (scanned pages)
 
-    init(originalImage: SendableImage, image: SendableImage,
-         dpi: Double, sourceName: String, ocr: OCRPageResult?) {
+    init(originalImage: SendableImage, image: SendableImage, dpi: Double,
+         sourceName: String, ocr: OCRPageResult?, cropToContent: Bool) {
         self.originalImage = originalImage
         self.image = image
         self.dpi = dpi
         self.sourceName = sourceName
         self.ocr = ocr
+        self.cropToContent = cropToContent
     }
 
     convenience init(_ p: ProcessedPage) {
-        self.init(originalImage: p.original, image: p.image,
-                  dpi: p.dpi, sourceName: p.sourceName, ocr: p.ocr)
+        self.init(originalImage: p.original, image: p.image, dpi: p.dpi,
+                  sourceName: p.sourceName, ocr: p.ocr, cropToContent: p.cropToContent)
     }
 
     var nsImage: NSImage {
@@ -34,8 +36,8 @@ final class PageVM: Identifiable {
 
     var processed: ProcessedPage? {
         guard let ocr else { return nil }
-        return ProcessedPage(image: image, original: originalImage,
-                             dpi: dpi, ocr: ocr, sourceName: sourceName)
+        return ProcessedPage(image: image, original: originalImage, dpi: dpi,
+                             ocr: ocr, sourceName: sourceName, cropToContent: cropToContent)
     }
 }
 
@@ -103,12 +105,13 @@ final class AppModel {
     /// original using the current settings, so changing preprocessing/OCR options
     /// takes effect without compounding earlier preprocessing.
     func rerunOCR() {
-        let snapshot = pages.map { ($0.id, $0.originalImage, $0.dpi, $0.sourceName) }
+        let snapshot = pages.map { ($0.id, $0.originalImage, $0.dpi, $0.sourceName, $0.cropToContent) }
         guard !snapshot.isEmpty else { return }
         runJob("Recognizing text…") { [settings] in
             var updates: [(PageVM.ID, ProcessedPage)] = []
-            for (id, original, dpi, name) in snapshot {
-                let p = await self.jobs.processImage(original, dpi: dpi, name: name, settings: settings)
+            for (id, original, dpi, name, crop) in snapshot {
+                let p = await self.jobs.processImage(original, dpi: dpi, name: name,
+                                                     settings: settings, cropToContent: crop)
                 updates.append((id, p))
             }
             await MainActor.run {
@@ -170,7 +173,9 @@ final class AppModel {
             Task { [settings = self.settings] in
                 var newPages: [PageVM] = []
                 for url in scannedURLs {
-                    let processed = await self.jobs.process(url: url, settings: settings)
+                    let processed = await self.jobs.process(
+                        url: url, settings: settings,
+                        cropToContent: settings.autoCropScannedPages)
                     newPages.append(contentsOf: processed.map(PageVM.init))
                 }
                 self.pages.append(contentsOf: newPages)

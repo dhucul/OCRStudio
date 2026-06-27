@@ -23,6 +23,8 @@ struct SettingsView: View {
 
             // Image preprocessing
             Form {
+                Toggle("Auto-center scanned pages (trim scanner-bed margins)",
+                       isOn: $model.settings.autoCropScannedPages)
                 Toggle("Auto-crop & deskew (photographed docs)",
                        isOn: $model.settings.autoCropDeskew)
                 Toggle("Enhance contrast", isOn: $model.settings.enhanceContrast)

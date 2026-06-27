@@ -35,7 +35,14 @@ actor FileIngestor {
     private func ingestImage(url: URL) -> IngestedPage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
-        return IngestedPage(image: SendableImage(cgImage: cg), dpi: 72,
+        // Use the image's real DPI (scanners write it) so the PDF is sized
+        // correctly; fall back to 72 if absent.
+        var dpi = 72.0
+        if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let d = props[kCGImagePropertyDPIWidth] as? Double, d > 0 {
+            dpi = d
+        }
+        return IngestedPage(image: SendableImage(cgImage: cg), dpi: dpi,
                             existingText: "", hasTextLayer: false)
     }
 

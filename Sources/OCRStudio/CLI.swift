@@ -26,6 +26,7 @@ enum HeadlessCLI {
             if args[i] == "--out", i + 1 < args.count {
                 output = URL(fileURLWithPath: args[i + 1]); i += 2; continue
             }
+            if args[i] == "--crop" { i += 1; continue }   // handled separately
             inputs.append(URL(fileURLWithPath: args[i])); i += 1
         }
 
@@ -37,25 +38,28 @@ enum HeadlessCLI {
 
         let out = output ?? inputs[0].deletingPathExtension()
             .appendingPathExtension("ocr.pdf")
+        let crop = args.contains("--crop")   // emulate scanned-page content crop
 
         let semaphore = DispatchSemaphore(value: 0)
         Task {
-            await run(inputs: inputs, output: out)
+            await run(inputs: inputs, output: out, cropToContent: crop)
             semaphore.signal()
         }
         semaphore.wait()
         return true
     }
 
-    private static func run(inputs: [URL], output: URL) async {
+    private static func run(inputs: [URL], output: URL, cropToContent: Bool) async {
         let jobs = JobManager()
         let settings = Settings.load()
 
         var pages: [ProcessedPage] = []
         for input in inputs {
-            let produced = await jobs.process(url: input, settings: settings)
+            let produced = await jobs.process(url: input, settings: settings,
+                                              cropToContent: cropToContent)
             pages.append(contentsOf: produced)
-            print("• \(input.lastPathComponent): \(produced.count) page(s)")
+            print("• \(input.lastPathComponent): \(produced.count) page(s)"
+                  + (cropToContent ? " [crop]" : ""))
         }
         guard !pages.isEmpty else { print("No pages produced."); return }
 
