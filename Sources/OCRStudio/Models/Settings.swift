@@ -40,6 +40,59 @@ struct Settings: Codable, Sendable {
     var outputDirectory: URL?
     var watchFolder: URL?
 
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case recognitionLanguages
+        case automaticLanguageDetection
+        case detectBarcodes
+        case autoCropDeskew
+        case enhanceContrast
+        case denoise
+        case grayscale
+        case autoCropScannedPages
+        case skipBlankPages
+        case rasterDPI
+        case textLayerPolicy
+        case outputDirectory
+        case watchFolder
+    }
+
+    /// Decode each field independently so settings saved by an older app version
+    /// retain their values when newer fields are introduced.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        recognitionLanguages = try values.decodeIfPresent(
+            [String].self, forKey: .recognitionLanguages
+        ) ?? ["en-US"]
+        automaticLanguageDetection = try values.decodeIfPresent(
+            Bool.self, forKey: .automaticLanguageDetection
+        ) ?? true
+        detectBarcodes = try values.decodeIfPresent(
+            Bool.self, forKey: .detectBarcodes
+        ) ?? true
+        autoCropDeskew = try values.decodeIfPresent(
+            Bool.self, forKey: .autoCropDeskew
+        ) ?? false
+        enhanceContrast = try values.decodeIfPresent(
+            Bool.self, forKey: .enhanceContrast
+        ) ?? true
+        denoise = try values.decodeIfPresent(Bool.self, forKey: .denoise) ?? true
+        grayscale = try values.decodeIfPresent(Bool.self, forKey: .grayscale) ?? false
+        autoCropScannedPages = try values.decodeIfPresent(
+            Bool.self, forKey: .autoCropScannedPages
+        ) ?? true
+        skipBlankPages = try values.decodeIfPresent(
+            Bool.self, forKey: .skipBlankPages
+        ) ?? true
+        rasterDPI = try values.decodeIfPresent(Double.self, forKey: .rasterDPI) ?? 200
+        textLayerPolicy = try values.decodeIfPresent(
+            TextLayerPolicy.self, forKey: .textLayerPolicy
+        ) ?? .ocrIfSparse
+        outputDirectory = try values.decodeIfPresent(URL.self, forKey: .outputDirectory)
+        watchFolder = try values.decodeIfPresent(URL.self, forKey: .watchFolder)
+    }
+
     var preprocessOptions: ImagePreprocessOptions {
         ImagePreprocessOptions(autoCropDeskew: autoCropDeskew,
                                enhanceContrast: enhanceContrast,

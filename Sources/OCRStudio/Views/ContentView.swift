@@ -25,6 +25,7 @@ struct ContentView: View {
             Button { model.openFilePicker() } label: {
                 Label("Open", systemImage: "folder")
             }
+            .disabled(model.isBusy)
             Button { model.rerunOCR() } label: {
                 Label("Run OCR", systemImage: "text.viewfinder")
             }
@@ -61,7 +62,7 @@ struct ContentView: View {
             Button(role: .destructive) { model.clear() } label: {
                 Label("Clear", systemImage: "trash")
             }
-            .disabled(!model.hasPages)
+            .disabled(!model.hasPages || model.isBusy)
         }
     }
 

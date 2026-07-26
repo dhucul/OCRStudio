@@ -59,7 +59,9 @@ private struct ScanPanelInner: View {
         }
         .padding(12)
         .onChange(of: scanner.scanners.map(\.id)) { _, ids in
-            if selectedScanner.isEmpty, let first = ids.first { selectedScanner = first }
+            if !ids.contains(selectedScanner) {
+                selectedScanner = ids.first ?? ""
+            }
         }
     }
 

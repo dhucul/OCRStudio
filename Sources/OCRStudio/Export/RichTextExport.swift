@@ -66,7 +66,6 @@ enum RichTextExport {
 
     /// Render the text into a paginated, selectable PDF (a text document — not the scan).
     static func writeTextPDF(pages: [String], to url: URL) throws {
-        let attr = attributed(from: pages)
         let pageW: CGFloat = 612, pageH: CGFloat = 792, margin: CGFloat = 54
         let textRect = CGRect(x: margin, y: margin, width: pageW - 2 * margin, height: pageH - 2 * margin)
         var mediaBox = CGRect(x: 0, y: 0, width: pageW, height: pageH)
@@ -76,20 +75,30 @@ enum RichTextExport {
             throw CocoaError(.fileWriteUnknown)
         }
 
-        let framesetter = CTFramesetterCreateWithAttributedString(attr)
         let path = CGPath(rect: textRect, transform: nil)
-        let total = attr.length
-        var start = 0
+        for page in pages {
+            let attr = attributed(from: [page])
+            let framesetter = CTFramesetterCreateWithAttributedString(attr)
+            let total = attr.length
+            var start = 0
 
-        repeat {
-            ctx.beginPDFPage(nil)
-            let frame = CTFramesetterCreateFrame(framesetter, CFRange(location: start, length: 0), path, nil)
-            CTFrameDraw(frame, ctx)
-            let visible = CTFrameGetVisibleStringRange(frame)
-            ctx.endPDFPage()
-            if visible.length <= 0 { break }          // nothing fit (or empty) → stop
-            start += visible.length
-        } while start < total
+            // Every logical input page begins on a fresh PDF page. Long pages may
+            // continue onto additional sheets, while an empty page still emits one.
+            repeat {
+                ctx.beginPDFPage(nil)
+                let frame = CTFramesetterCreateFrame(
+                    framesetter,
+                    CFRange(location: start, length: 0),
+                    path,
+                    nil
+                )
+                CTFrameDraw(frame, ctx)
+                let visible = CTFrameGetVisibleStringRange(frame)
+                ctx.endPDFPage()
+                if visible.length <= 0 { break }
+                start += visible.length
+            } while start < total
+        }
 
         ctx.closePDF()
     }

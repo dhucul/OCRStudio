@@ -1,6 +1,32 @@
 import Foundation
 import CoreGraphics
 
+enum PipelineError: LocalizedError, Sendable {
+    case unsupportedFile(URL)
+    case unreadableFile(URL)
+    case unreadablePage(URL, page: Int)
+    case noPages(URL)
+    case invalidDPI(Double)
+    case oversizedPage(URL, page: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedFile(let url):
+            return "Unsupported file type: \(url.lastPathComponent)"
+        case .unreadableFile(let url):
+            return "Could not read \(url.lastPathComponent)."
+        case .unreadablePage(let url, let page):
+            return "Could not render page \(page) of \(url.lastPathComponent)."
+        case .noPages(let url):
+            return "No readable pages were found in \(url.lastPathComponent)."
+        case .invalidDPI(let dpi):
+            return "Invalid PDF rasterization resolution: \(dpi)."
+        case .oversizedPage(let url, let page):
+            return "Page \(page) of \(url.lastPathComponent) is too large to rasterize safely."
+        }
+    }
+}
+
 /// One fully-processed page. `image` is the (possibly preprocessed) image that OCR
 /// ran on — and therefore the one the boxes and PDF visible layer must use.
 /// `original` is the untouched source, kept so the pipeline can be re-run from
@@ -31,36 +57,40 @@ actor JobManager {
 
     /// Ingest a file and run each page through preprocessing + OCR.
     /// `cropToContent` trims empty margins (used for full-bed scans).
-    func process(url: URL, settings: Settings, cropToContent: Bool = false) async -> [ProcessedPage] {
-        let pages = await ingestor.ingest(url: url, dpi: settings.rasterDPI)
+    func process(url: URL, settings: Settings,
+                 cropToContent: Bool = false) async throws -> [ProcessedPage] {
+        let pages = try await ingestor.ingest(url: url, dpi: settings.rasterDPI)
         let name = url.lastPathComponent
         var out: [ProcessedPage] = []
         out.reserveCapacity(pages.count)
         for page in pages {
-            out.append(await processPage(page, sourceName: name, settings: settings,
-                                         cropToContent: cropToContent))
+            out.append(try await processPage(page, sourceName: name, settings: settings,
+                                             cropToContent: cropToContent))
         }
+        guard !out.isEmpty else { throw PipelineError.noPages(url) }
         return out
     }
 
     /// Run a single in-memory image (e.g. a freshly scanned page) through the pipeline.
     func processImage(_ image: SendableImage, dpi: Double, name: String,
-                      settings: Settings, cropToContent: Bool = false) async -> ProcessedPage {
-        let page = IngestedPage(image: image, dpi: dpi, existingText: "", hasTextLayer: false)
-        return await processPage(page, sourceName: name, settings: settings,
-                                 cropToContent: cropToContent)
+                      settings: Settings,
+                      cropToContent: Bool = false) async throws -> ProcessedPage {
+        let page = IngestedPage(image: image, dpi: dpi, existingText: "",
+                                existingLines: [], hasTextLayer: false)
+        return try await processPage(page, sourceName: name, settings: settings,
+                                     cropToContent: cropToContent)
     }
 
     private func processPage(_ page: IngestedPage, sourceName: String,
-                             settings: Settings, cropToContent: Bool) async -> ProcessedPage {
+                             settings: Settings,
+                             cropToContent: Bool) async throws -> ProcessedPage {
         let prepared = await preprocessor.process(image: page.image,
                                                   options: settings.preprocessOptions)
         var result: OCRPageResult
         if shouldOCR(page, policy: settings.textLayerPolicy) {
-            result = (try? await ocr.recognize(image: prepared, options: settings.ocrOptions))
-                ?? emptyResult(for: prepared)
+            result = try await ocr.recognize(image: prepared, options: settings.ocrOptions)
         } else {
-            result = resultFromExistingText(page.existingText, image: prepared)
+            result = resultFromExistingText(page.existingLines, image: prepared)
         }
 
         var outImage = prepared
@@ -144,6 +174,7 @@ actor JobManager {
 
     private func shouldOCR(_ page: IngestedPage, policy: TextLayerPolicy) -> Bool {
         guard page.hasTextLayer else { return true }   // image-only page → always OCR
+        guard !page.existingLines.isEmpty else { return true } // raster export needs text geometry
         switch policy {
         case .forceOCR:   return true
         case .skip:       return false
@@ -151,16 +182,8 @@ actor JobManager {
         }
     }
 
-    private func emptyResult(for image: SendableImage) -> OCRPageResult {
-        OCRPageResult(lines: [], barcodes: [], imageWidth: image.width, imageHeight: image.height)
-    }
-
-    private func resultFromExistingText(_ text: String, image: SendableImage) -> OCRPageResult {
-        // No geometry available for a pre-existing text layer; carry the text so
-        // text/MD/JSON exports still work (boxes are zero → skipped in the PDF layer).
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map {
-            OCRLine(text: String($0), box: .zero, confidence: 1.0, words: [])
-        }
+    private func resultFromExistingText(_ lines: [OCRLine],
+                                        image: SendableImage) -> OCRPageResult {
         return OCRPageResult(lines: lines, barcodes: [],
                              imageWidth: image.width, imageHeight: image.height)
     }
@@ -178,15 +201,17 @@ actor JobManager {
     /// plus a sidecar .txt next to it (or into `outputDir`). Returns the PDF URL.
     @discardableResult
     func autoProcess(url: URL, settings: Settings) async throws -> URL {
-        let pages = await process(url: url, settings: settings)
+        let pages = try await process(url: url, settings: settings)
+        guard !pages.isEmpty else { throw PipelineError.noPages(url) }
         let dir = settings.outputDirectory ?? url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let base = url.deletingPathExtension().lastPathComponent + Self.outputSuffix
         let pdfURL = dir.appendingPathComponent("\(base).pdf")
         try await writeSearchablePDF(pages, to: pdfURL)
 
         let txt = Exporters.plainText(pages.map(\.ocr))
-        try? txt.write(to: dir.appendingPathComponent("\(base).txt"),
-                       atomically: true, encoding: .utf8)
+        try txt.write(to: dir.appendingPathComponent("\(base).txt"),
+                      atomically: true, encoding: .utf8)
         return pdfURL
     }
 }

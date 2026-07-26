@@ -56,6 +56,7 @@ final class ScannerService: NSObject, ObservableObject {
 
     private let browser = ICDeviceBrowser()
     private var devicesByID: [String: ICScannerDevice] = [:]
+    private var deviceIDs: [ObjectIdentifier: String] = [:]
 
     // Active job state
     private var activeScanner: ICScannerDevice?
@@ -69,7 +70,6 @@ final class ScannerService: NSObject, ObservableObject {
         downloadsDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("OCRStudioScans", isDirectory: true)
         super.init()
-        try? FileManager.default.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
 
         browser.delegate = self
         browser.browsedDeviceTypeMask = Self.scannerBrowseMask
@@ -126,6 +126,7 @@ final class ScannerService: NSObject, ObservableObject {
     }
 
     private func finish(_ error: Error?) {
+        guard isScanning else { return }
         isScanning = false
         statusMessage = error == nil ? "Scan complete" : "Scan failed: \(error!.localizedDescription)"
         let completion = onComplete
@@ -140,8 +141,17 @@ final class ScannerService: NSObject, ObservableObject {
     // MARK: Configuration once the unit is selected
 
     private func configureAndScan(_ scanner: ICScannerDevice) {
+        guard scanner === activeScanner else { return }
         guard let options = pendingOptions else {
             finish(ScannerError.configuration); return
+        }
+        do {
+            try FileManager.default.createDirectory(
+                at: downloadsDir, withIntermediateDirectories: true
+            )
+        } catch {
+            finish(error)
+            return
         }
         let unit = scanner.selectedFunctionalUnit
 
@@ -187,6 +197,18 @@ final class ScannerService: NSObject, ObservableObject {
             adf.documentType = candidate
             return
         }
+        if let fallback = supported.first, fallback >= 0,
+           let documentType = ICScannerDocumentType(rawValue: UInt(fallback)) {
+            adf.documentType = documentType
+        }
+    }
+
+    private func stableID(for scanner: ICScannerDevice) -> String {
+        let objectID = ObjectIdentifier(scanner)
+        if let existing = deviceIDs[objectID] { return existing }
+        let id = scanner.uuidString ?? "scanner-\(UUID().uuidString)"
+        deviceIDs[objectID] = id
+        return id
     }
 }
 
@@ -208,13 +230,16 @@ enum ScannerError: LocalizedError {
 extension ScannerService: ICDeviceBrowserDelegate {
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
         guard let scanner = device as? ICScannerDevice else { return }
-        devicesByID[scanner.uuidString ?? scanner.name ?? UUID().uuidString] = scanner
+        devicesByID[stableID(for: scanner)] = scanner
         rebuildScannerList()
     }
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
-        if let scanner = device as? ICScannerDevice, let key = scanner.uuidString {
-            devicesByID[key] = nil
+        if let scanner = device as? ICScannerDevice {
+            let objectID = ObjectIdentifier(scanner)
+            if let key = deviceIDs.removeValue(forKey: objectID) ?? scanner.uuidString {
+                devicesByID[key] = nil
+            }
         }
         rebuildScannerList()
     }
@@ -242,12 +267,14 @@ extension ScannerService: ICScannerDeviceDelegate {
     }
 
     func device(_ device: ICDevice, didEncounterError error: Error?) {
-        if device === activeScanner { finish(error ?? ScannerError.deviceError("Unknown error")) }
+        guard isScanning, device === activeScanner else { return }
+        finish(error ?? ScannerError.deviceError("Unknown error"))
     }
 
     // ICDeviceDelegate — optional
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
-        if let error { finish(error) }
+        guard isScanning, device === activeScanner else { return }
+        if let error { finish(error); return }
         // Otherwise wait for `scannerDeviceDidBecomeAvailable`.
     }
 
@@ -262,6 +289,7 @@ extension ScannerService: ICScannerDeviceDelegate {
 
     // ICScannerDeviceDelegate
     func scannerDeviceDidBecomeAvailable(_ scanner: ICScannerDevice) {
+        guard isScanning, scanner === activeScanner else { return }
         guard let options = pendingOptions else { return }
 
         let available = scanner.availableFunctionalUnitTypes.compactMap {
@@ -280,15 +308,18 @@ extension ScannerService: ICScannerDeviceDelegate {
     func scannerDevice(_ scanner: ICScannerDevice,
                        didSelect functionalUnit: ICScannerFunctionalUnit,
                        error: Error?) {
+        guard isScanning, scanner === activeScanner else { return }
         if let error { finish(error); return }
         configureAndScan(scanner)
     }
 
     func scannerDevice(_ scanner: ICScannerDevice, didScanTo url: URL) {
+        guard isScanning, scanner === activeScanner else { return }
         onPage?(url)     // one call per page (e.g. each ADF / duplex side)
     }
 
     func scannerDevice(_ scanner: ICScannerDevice, didCompleteScanWithError error: Error?) {
+        guard isScanning, scanner === activeScanner else { return }
         finish(error)
     }
 }

@@ -7,10 +7,28 @@ import Foundation
 
 let W: CGFloat = 600, H: CGFloat = 420
 
-func render(_ scale: CGFloat) -> CGImage {
-    let ctx = CGContext(data: nil, width: Int(W * scale), height: Int(H * scale),
-                        bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+enum BackgroundError: LocalizedError {
+    case graphicsContext
+    case imageCreation
+    case destination(URL)
+    case finalization(URL)
+
+    var errorDescription: String? {
+        switch self {
+        case .graphicsContext: return "Could not create the bitmap graphics context."
+        case .imageCreation: return "Could not render the background image."
+        case .destination(let url): return "Could not create PNG destination at \(url.path)."
+        case .finalization(let url): return "Could not finish PNG at \(url.path)."
+        }
+    }
+}
+
+func render(_ scale: CGFloat) throws -> CGImage {
+    guard let ctx = CGContext(
+        data: nil, width: Int(W * scale), height: Int(H * scale),
+        bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { throw BackgroundError.graphicsContext }
     ctx.scaleBy(x: scale, y: scale)   // draw in 600x420 design coordinates
 
     // Soft vertical gradient.
@@ -44,17 +62,37 @@ func render(_ scale: CGFloat) -> CGImage {
          NSColor(red: 0.32, green: 0.38, blue: 0.50, alpha: 1), topY: 74)
     NSGraphicsContext.current = nil
 
-    return ctx.makeImage()!
+    guard let image = ctx.makeImage() else { throw BackgroundError.imageCreation }
+    return image
 }
 
-func writePNG(_ image: CGImage, to path: String) {
+func writePNG(_ image: CGImage, to path: String) throws {
     let url = URL(fileURLWithPath: path)
-    let dst = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
+    guard let dst = CGImageDestinationCreateWithURL(
+        url as CFURL, UTType.png.identifier as CFString, 1, nil
+    ) else { throw BackgroundError.destination(url) }
     CGImageDestinationAddImage(dst, image, nil)
-    CGImageDestinationFinalize(dst)
+    guard CGImageDestinationFinalize(dst) else {
+        throw BackgroundError.finalization(url)
+    }
 }
 
-let dir = CommandLine.arguments[1]
-writePNG(render(1), to: dir + "/bg.png")
-writePNG(render(2), to: dir + "/bg@2x.png")
-print("wrote backgrounds to \(dir)")
+guard CommandLine.arguments.count == 2 else {
+    FileHandle.standardError.write(
+        Data("usage: swift scripts/make-dmg-bg.swift <output-dir>\n".utf8)
+    )
+    exit(64)
+}
+
+do {
+    let dir = CommandLine.arguments[1]
+    try FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: dir), withIntermediateDirectories: true
+    )
+    try writePNG(try render(1), to: dir + "/bg.png")
+    try writePNG(try render(2), to: dir + "/bg@2x.png")
+    print("wrote backgrounds to \(dir)")
+} catch {
+    FileHandle.standardError.write(Data(("error: \(error.localizedDescription)\n").utf8))
+    exit(EXIT_FAILURE)
+}

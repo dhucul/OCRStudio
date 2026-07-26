@@ -16,6 +16,11 @@ struct ComposablePage: Sendable {
 actor PDFComposer {
 
     func makeSearchablePDF(pages: [ComposablePage], to url: URL) throws {
+        guard !pages.isEmpty else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [
+                NSLocalizedDescriptionKey: "Cannot create a PDF with no pages."
+            ])
+        }
         guard let consumer = CGDataConsumer(url: url as CFURL) else {
             throw CocoaError(.fileWriteUnknown)
         }

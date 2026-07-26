@@ -9,7 +9,7 @@ let package = Package(
             name: "OCRStudio",
             path: "Sources/OCRStudio",
             swiftSettings: [
-                .swiftLanguageMode(.v5)
+                .swiftLanguageMode(.v6)
             ],
             linkerSettings: [
                 .linkedFramework("ImageCaptureCore"),
@@ -18,7 +18,12 @@ let package = Package(
                 .linkedFramework("CoreImage"),
                 .linkedFramework("AppKit")
             ]
+        ),
+        .testTarget(
+            name: "OCRStudioTests",
+            dependencies: ["OCRStudio"],
+            path: "Tests/OCRStudioTests"
         )
     ],
-    swiftLanguageModes: [.v5]
+    swiftLanguageModes: [.v6]
 )

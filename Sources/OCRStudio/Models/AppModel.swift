@@ -59,7 +59,12 @@ final class AppModel {
     var isWatching: Bool = false
 
     var settings: Settings = .load() {
-        didSet { settings.save() }
+        didSet {
+            settings.save()
+            if oldValue.watchFolder != settings.watchFolder, isWatching {
+                configureWatch(folder: settings.watchFolder)
+            }
+        }
     }
 
     // Scan options bound by the UI.
@@ -72,6 +77,8 @@ final class AppModel {
     @ObservationIgnored let scanner = ScannerService()
     @ObservationIgnored private let jobs = JobManager()
     @ObservationIgnored private let watcher = WatchFolderService()
+    @ObservationIgnored private var watchRequestID = 0
+    @ObservationIgnored private var watchConfigurationTask: Task<Void, Never>?
 
     var selectedPage: PageVM? { pages.first { $0.id == selectedPageID } }
     var hasPages: Bool { !pages.isEmpty }
@@ -80,6 +87,7 @@ final class AppModel {
     // MARK: Open files
 
     func openFilePicker() {
+        guard !isBusy else { return }
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
@@ -92,11 +100,11 @@ final class AppModel {
     }
 
     func importFiles(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty, !isBusy else { return }
         runJob("Reading \(urls.count) file(s)…") { [settings] in
             var newPages: [PageVM] = []
             for url in urls {
-                let processed = await self.jobs.process(url: url, settings: settings)
+                let processed = try await self.jobs.process(url: url, settings: settings)
                 newPages.append(contentsOf: processed.map(PageVM.init))
             }
             await MainActor.run {
@@ -118,8 +126,9 @@ final class AppModel {
         runJob("Recognizing text…") { [settings] in
             var updates: [(PageVM.ID, ProcessedPage)] = []
             for (id, original, dpi, name, crop) in snapshot {
-                let p = await self.jobs.processImage(original, dpi: dpi, name: name,
-                                                     settings: settings, cropToContent: crop)
+                let p = try await self.jobs.processImage(original, dpi: dpi, name: name,
+                                                         settings: settings,
+                                                         cropToContent: crop)
                 updates.append((id, p))
             }
             await MainActor.run {
@@ -159,6 +168,7 @@ final class AppModel {
     }
 
     func scan(scannerID: String) {
+        guard !isBusy else { return }
         var options = ScanJobOptions()
         options.source = scanSource
         options.pageSize = scanPageSize
@@ -174,31 +184,37 @@ final class AppModel {
                      onComplete: { [weak self] error in
             guard let self else { return }
             if let error {
+                self.removeScanFiles(scannedURLs)
                 self.isBusy = false
                 self.status = "Scan failed: \(error.localizedDescription)"
                 return
             }
             self.status = "Recognizing \(scannedURLs.count) scanned page(s)…"
             Task { [settings = self.settings] in
-                var newPages: [PageVM] = []
-                var blanks = 0
-                for url in scannedURLs {
-                    let processed = await self.jobs.process(
-                        url: url, settings: settings,
-                        cropToContent: settings.autoCropScannedPages)
-                    for page in processed {
-                        if settings.skipBlankPages, await self.jobs.isBlankPage(page) {
-                            blanks += 1
-                        } else {
-                            newPages.append(PageVM(page))
+                defer { self.removeScanFiles(scannedURLs) }
+                do {
+                    var newPages: [PageVM] = []
+                    var blanks = 0
+                    for url in scannedURLs {
+                        let processed = try await self.jobs.process(
+                            url: url, settings: settings,
+                            cropToContent: settings.autoCropScannedPages)
+                        for page in processed {
+                            if settings.skipBlankPages, await self.jobs.isBlankPage(page) {
+                                blanks += 1
+                            } else {
+                                newPages.append(PageVM(page))
+                            }
                         }
                     }
+                    self.pages.append(contentsOf: newPages)
+                    if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
+                    self.status = "Scanned \(newPages.count) page(s)"
+                        + (blanks > 0 ? " · skipped \(blanks) blank" : "")
+                } catch {
+                    self.status = "Scan processing failed: \(error.localizedDescription)"
                 }
-                self.pages.append(contentsOf: newPages)
-                if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
                 self.isBusy = false
-                self.status = "Scanned \(newPages.count) page(s)"
-                    + (blanks > 0 ? " · skipped \(blanks) blank" : "")
             }
         })
     }
@@ -214,27 +230,60 @@ final class AppModel {
             status = "Choose a watch folder in Settings first"
             return
         }
-        watcher.onFile = { [weak self] url in
-            guard let self else { return }
-            self.status = "Auto-processing \(url.lastPathComponent)…"
-            Task { [settings = self.settings] in
-                do {
-                    let pdf = try await self.jobs.autoProcess(url: url, settings: settings)
-                    self.status = "Wrote \(pdf.lastPathComponent)"
-                } catch {
-                    self.status = "Auto-process failed: \(error.localizedDescription)"
-                }
-            }
-        }
-        watcher.start(folder: folder)
-        isWatching = true
-        status = "Watching \(folder.lastPathComponent)"
+        configureWatch(folder: folder)
     }
 
     private func stopWatch() {
-        watcher.stop()
+        configureWatch(folder: nil)
+    }
+
+    private func configureWatch(folder: URL?) {
+        watchRequestID += 1
+        let requestID = watchRequestID
+        let previousTask = watchConfigurationTask
+        previousTask?.cancel()
         isWatching = false
-        status = "Stopped watching"
+        status = folder == nil ? "Stopped watching" : "Starting watch…"
+
+        watchConfigurationTask = Task {
+            _ = await previousTask?.result
+            guard !Task.isCancelled, requestID == watchRequestID else { return }
+            await watcher.stop()
+            guard !Task.isCancelled, requestID == watchRequestID else { return }
+            guard let folder else { return }
+
+            await watcher.setHandler { [weak self] url in
+                guard let self else { return false }
+                let settings = self.settings
+                if !self.isBusy {
+                    self.status = "Auto-processing \(url.lastPathComponent)…"
+                }
+                do {
+                    let pdf = try await self.jobs.autoProcess(url: url, settings: settings)
+                    if !self.isBusy { self.status = "Wrote \(pdf.lastPathComponent)" }
+                    return true
+                } catch {
+                    if !self.isBusy {
+                        self.status = "Auto-process failed: \(error.localizedDescription) · will retry"
+                    }
+                    return false
+                }
+            }
+
+            do {
+                try await watcher.start(folder: folder)
+                guard !Task.isCancelled, requestID == watchRequestID else {
+                    await watcher.stop()
+                    return
+                }
+                isWatching = true
+                status = "Watching \(folder.lastPathComponent)"
+            } catch {
+                guard !Task.isCancelled, requestID == watchRequestID else { return }
+                isWatching = false
+                status = "Could not watch folder: \(error.localizedDescription)"
+            }
+        }
     }
 
     // MARK: Exports
@@ -255,17 +304,25 @@ final class AppModel {
     func exportWord() {
         let type = UTType(filenameExtension: "docx") ?? .data
         guard let url = savePanel(suggested: "Document.docx", type: type) else { return }
+        let pageText = editedPages
         runJob("Writing Word document…") {
-            let data = RichTextExport.wordData(from: self.editedPages)
-            try data.write(to: url)
+            let data = await Task.detached {
+                RichTextExport.wordData(from: pageText)
+            }.value
+            try await Task.detached {
+                try data.write(to: url, options: .atomic)
+            }.value
             return "Saved \(url.lastPathComponent)"
         }
     }
 
     func exportTextPDF() {
         guard let url = savePanel(suggested: "Document.pdf", type: .pdf) else { return }
+        let pageText = editedPages
         runJob("Writing PDF…") {
-            try RichTextExport.writeTextPDF(pages: self.editedPages, to: url)
+            try await Task.detached {
+                try RichTextExport.writeTextPDF(pages: pageText, to: url)
+            }.value
             return "Saved \(url.lastPathComponent)"
         }
     }
@@ -283,14 +340,23 @@ final class AppModel {
 
     func exportJSON() {
         guard let url = savePanel(suggested: "Scan.json", type: .json) else { return }
+        let results = ocrResults
         runJob("Writing JSON…") {
-            let data = try Exporters.json(self.ocrResults)
-            try data.write(to: url)
+            let data = try await Task.detached {
+                try Exporters.json(results)
+            }.value
+            try await Task.detached {
+                try data.write(to: url, options: .atomic)
+            }.value
             return "Saved \(url.lastPathComponent)"
         }
     }
 
     func clear() {
+        guard !isBusy else {
+            status = "Wait for the current operation to finish before clearing"
+            return
+        }
         pages.removeAll()
         selectedPageID = nil
         status = "Cleared"
@@ -317,8 +383,16 @@ final class AppModel {
 
     private func writeString(_ string: String, to url: URL) {
         runJob("Saving…") {
-            try string.write(to: url, atomically: true, encoding: .utf8)
+            try await Task.detached {
+                try string.write(to: url, atomically: true, encoding: .utf8)
+            }.value
             return "Saved \(url.lastPathComponent)"
+        }
+    }
+
+    private func removeScanFiles(_ urls: [URL]) {
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
@@ -331,6 +405,10 @@ final class AppModel {
 
     /// Run async work with busy/status bookkeeping. The closure returns a status string.
     private func runJob(_ startStatus: String, _ work: @escaping () async throws -> String) {
+        guard !isBusy else {
+            status = "Another operation is already in progress"
+            return
+        }
         isBusy = true
         status = startStatus
         Task {

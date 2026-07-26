@@ -43,7 +43,14 @@ enum DocxWriter {
         // Drop characters not permitted in XML 1.0 (control chars other than
         // tab/newline/CR) so odd pasted input can't produce an unopenable file.
         let cleaned = String(String.UnicodeScalarView(
-            s.unicodeScalars.filter { $0.value == 9 || $0.value == 10 || $0.value == 13 || $0.value >= 32 }))
+            s.unicodeScalars.filter { scalar in
+                let value = scalar.value
+                return value == 0x9 || value == 0xA || value == 0xD
+                    || (0x20...0xD7FF).contains(value)
+                    || (0xE000...0xFFFD).contains(value)
+                    || (0x10000...0x10FFFF).contains(value)
+            }
+        ))
         return cleaned
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")

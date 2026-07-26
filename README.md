@@ -52,6 +52,7 @@ grant stick, create a stable signing identity once:
 
 ```bash
 swift build            # debug build at .build/debug/OCRStudio
+swift test             # regression suite
 swift run OCRStudio    # launch the GUI directly
 ```
 
@@ -63,6 +64,8 @@ verification:
 ```bash
 .build/debug/OCRStudio --ocr page1.png page2.pdf --out result.pdf
 # writes result.pdf (searchable), result.txt, and result.json
+# exits nonzero if any input or output fails
+# add --crop to trim scanner-bed margins around recognized content
 ```
 
 ## How it works

@@ -16,6 +16,7 @@ struct OCRStudioApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Open Files…") { model.openFilePicker() }
                     .keyboardShortcut("o", modifiers: .command)
+                    .disabled(model.isBusy)
             }
         }
 

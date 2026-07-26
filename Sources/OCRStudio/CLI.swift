@@ -8,111 +8,198 @@ import ImageCaptureCore
 ///   OCRStudio --list-scanners        # diagnostic: what ICA can actually see
 enum HeadlessCLI {
 
-    /// Returns true if the app was launched in headless mode (and has now finished).
-    static func runIfRequested() -> Bool {
+    private enum CLIError: LocalizedError {
+        case noPages
+        case outputMatchesInput(URL)
+
+        var errorDescription: String? {
+            switch self {
+            case .noPages:
+                return "No readable pages were produced."
+            case .outputMatchesInput(let url):
+                return "Output would overwrite input: \(url.path)"
+            }
+        }
+    }
+
+    private final class ExitCodeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: Int32 = EXIT_FAILURE
+
+        func set(_ value: Int32) {
+            lock.lock()
+            storage = value
+            lock.unlock()
+        }
+
+        func get() -> Int32 {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
+
+    /// Returns an exit status when headless mode was requested, otherwise nil.
+    static func runIfRequested() -> Int32? {
         let args = CommandLine.arguments
 
         if args.contains("--list-scanners") {
             ScannerLister.run()
-            return true
+            return EXIT_SUCCESS
         }
 
         if args.contains("--scanner-info") {
             ScannerInspector.run()
-            return true
+            return EXIT_SUCCESS
         }
 
-        if let i = args.firstIndex(of: "--ink"), i + 1 < args.count {
-            let url = URL(fileURLWithPath: args[i + 1])
-            let semaphore = DispatchSemaphore(value: 0)
-            Task {
-                let jobs = JobManager()
-                let pages = await jobs.process(url: url, settings: Settings(), cropToContent: false)
-                for p in pages {
-                    let blank = await jobs.isBlankPage(p)
-                    print("\(url.lastPathComponent): blank=\(blank)  lines=\(p.ocr.lines.count)")
-                }
-                semaphore.signal()
+        if let i = args.firstIndex(of: "--ink") {
+            guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+                return usage("usage: OCRStudio --ink <file>")
             }
-            semaphore.wait()
-            return true
+            let url = URL(fileURLWithPath: args[i + 1])
+            return waitForAsync {
+                do {
+                    let jobs = JobManager()
+                    let pages = try await jobs.process(
+                        url: url, settings: Settings(), cropToContent: false
+                    )
+                    guard !pages.isEmpty else { throw CLIError.noPages }
+                    for page in pages {
+                        let blank = await jobs.isBlankPage(page)
+                        print("\(url.lastPathComponent): blank=\(blank)  "
+                              + "lines=\(page.ocr.lines.count)")
+                    }
+                    return EXIT_SUCCESS
+                } catch {
+                    writeError("✗ \(error.localizedDescription)")
+                    return EXIT_FAILURE
+                }
+            }
         }
 
-        if let i = args.firstIndex(of: "--make-docx"), i + 1 < args.count {
-            let sample = ["Linux_Commands", "systemctl --master-disable",
-                          "This opening paragraph ends like a sentence."]
-            let data = RichTextExport.wordData(from: [sample.joined(separator: "\n")])
-            try? data.write(to: URL(fileURLWithPath: args[i + 1]))
-            print("wrote \(args[i + 1]) (\(data.count) bytes)")
-            return true
+        if let i = args.firstIndex(of: "--make-docx") {
+            guard i + 1 < args.count, !args[i + 1].hasPrefix("--") else {
+                return usage("usage: OCRStudio --make-docx <output.docx>")
+            }
+            let destination = URL(fileURLWithPath: args[i + 1])
+            do {
+                let sample = ["Linux_Commands", "systemctl --master-disable",
+                              "This opening paragraph ends like a sentence."]
+                let data = RichTextExport.wordData(from: [sample.joined(separator: "\n")])
+                try data.write(to: destination, options: .atomic)
+                print("wrote \(destination.path) (\(data.count) bytes)")
+                return EXIT_SUCCESS
+            } catch {
+                writeError("✗ Failed to write DOCX: \(error.localizedDescription)")
+                return EXIT_FAILURE
+            }
         }
 
-        guard let start = args.firstIndex(of: "--ocr") else { return false }
+        guard let start = args.firstIndex(of: "--ocr") else { return nil }
 
         var inputs: [URL] = []
         var output: URL?
-        var i = start + 1
-        while i < args.count {
-            if args[i] == "--out", i + 1 < args.count {
-                output = URL(fileURLWithPath: args[i + 1]); i += 2; continue
+        var crop = false
+        var index = start + 1
+        while index < args.count {
+            switch args[index] {
+            case "--out":
+                guard index + 1 < args.count, !args[index + 1].hasPrefix("--") else {
+                    return usage("usage: OCRStudio --ocr <file...> [--out <output.pdf>] [--crop]")
+                }
+                output = URL(fileURLWithPath: args[index + 1])
+                index += 2
+            case "--crop":
+                crop = true
+                index += 1
+            default:
+                guard !args[index].hasPrefix("--") else {
+                    return usage("unknown option: \(args[index])")
+                }
+                inputs.append(URL(fileURLWithPath: args[index]))
+                index += 1
             }
-            if args[i] == "--crop" { i += 1; continue }   // handled separately
-            inputs.append(URL(fileURLWithPath: args[i])); i += 1
         }
 
         guard !inputs.isEmpty else {
-            FileHandle.standardError.write(Data(
-                "usage: OCRStudio --ocr <file...> [--out <output.pdf>]\n".utf8))
-            return true
+            return usage("usage: OCRStudio --ocr <file...> [--out <output.pdf>] [--crop]")
         }
 
-        let out = output ?? inputs[0].deletingPathExtension()
+        let destination = output ?? inputs[0].deletingPathExtension()
             .appendingPathExtension("ocr.pdf")
-        let crop = args.contains("--crop")   // emulate scanned-page content crop
+        let parsedInputs = inputs
+        let shouldCrop = crop
+        return waitForAsync {
+            await run(inputs: parsedInputs, output: destination, cropToContent: shouldCrop)
+        }
+    }
 
+    private static func waitForAsync(
+        _ operation: @escaping @Sendable () async -> Int32
+    ) -> Int32 {
         let semaphore = DispatchSemaphore(value: 0)
+        let result = ExitCodeBox()
         Task {
-            await run(inputs: inputs, output: out, cropToContent: crop)
+            result.set(await operation())
             semaphore.signal()
         }
         semaphore.wait()
-        return true
+        return result.get()
     }
 
-    private static func run(inputs: [URL], output: URL, cropToContent: Bool) async {
-        let jobs = JobManager()
-        let settings = Settings.load()
-
-        var pages: [ProcessedPage] = []
-        for input in inputs {
-            let produced = await jobs.process(url: input, settings: settings,
-                                              cropToContent: cropToContent)
-            pages.append(contentsOf: produced)
-            print("• \(input.lastPathComponent): \(produced.count) page(s)"
-                  + (cropToContent ? " [crop]" : ""))
+    private static func run(inputs: [URL],
+                            output: URL,
+                            cropToContent: Bool) async -> Int32 {
+        let normalizedOutput = output.standardizedFileURL
+        if inputs.map(\.standardizedFileURL).contains(normalizedOutput) {
+            writeError("✗ \(CLIError.outputMatchesInput(output).localizedDescription)")
+            return EXIT_FAILURE
         }
-        guard !pages.isEmpty else { print("No pages produced."); return }
 
         do {
+            let jobs = JobManager()
+            let settings = Settings.load()
+            var pages: [ProcessedPage] = []
+            for input in inputs {
+                let produced = try await jobs.process(
+                    url: input, settings: settings, cropToContent: cropToContent
+                )
+                pages.append(contentsOf: produced)
+                print("• \(input.lastPathComponent): \(produced.count) page(s)"
+                      + (cropToContent ? " [crop]" : ""))
+            }
+            guard !pages.isEmpty else { throw CLIError.noPages }
+
             try await jobs.writeSearchablePDF(pages, to: output)
             print("✓ Searchable PDF → \(output.path)")
 
             let text = Exporters.plainText(pages.map(\.ocr))
             let textURL = output.deletingPathExtension().appendingPathExtension("txt")
-            try? text.write(to: textURL, atomically: true, encoding: .utf8)
+            try text.write(to: textURL, atomically: true, encoding: .utf8)
             print("✓ Text → \(textURL.path)")
 
-            if let json = try? Exporters.json(pages.map(\.ocr)) {
-                let jsonURL = output.deletingPathExtension().appendingPathExtension("json")
-                try? json.write(to: jsonURL)
-                print("✓ JSON → \(jsonURL.path)")
-            }
+            let json = try Exporters.json(pages.map(\.ocr))
+            let jsonURL = output.deletingPathExtension().appendingPathExtension("json")
+            try json.write(to: jsonURL, options: .atomic)
+            print("✓ JSON → \(jsonURL.path)")
 
             let preview = text.prefix(500)
             print("\n----- recognized text (first 500 chars) -----\n\(preview)\n----------------------------------------------")
+            return EXIT_SUCCESS
         } catch {
-            print("✗ Failed: \(error.localizedDescription)")
+            writeError("✗ Failed: \(error.localizedDescription)")
+            return EXIT_FAILURE
         }
+    }
+
+    private static func usage(_ message: String) -> Int32 {
+        writeError(message)
+        return 64 // EX_USAGE
+    }
+
+    private static func writeError(_ message: String) {
+        FileHandle.standardError.write(Data((message + "\n").utf8))
     }
 }
 
@@ -179,6 +266,7 @@ final class ScannerInspector: NSObject, ICDeviceBrowserDelegate, ICScannerDevice
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
         }
         if !insp.done { print("Timed out — no scanner, or a session couldn't be opened from the CLI.") }
+        insp.scanner?.requestCloseSession()
         insp.browser.stop()
     }
 
@@ -193,6 +281,8 @@ final class ScannerInspector: NSObject, ICDeviceBrowserDelegate, ICScannerDevice
     func didRemove(_ device: ICDevice) {}
     func device(_ device: ICDevice, didEncounterError error: Error?) {
         print("device error: \(error?.localizedDescription ?? "?")")
+        scanner?.requestCloseSession()
+        done = true
     }
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
         if let error { print("open-session error: \(error.localizedDescription)"); done = true }
@@ -208,7 +298,12 @@ final class ScannerInspector: NSObject, ICDeviceBrowserDelegate, ICScannerDevice
         s.requestSelect(t)
     }
     func scannerDevice(_ s: ICScannerDevice, didSelect unit: ICScannerFunctionalUnit, error: Error?) {
-        if let error { print("select error: \(error.localizedDescription)"); done = true; return }
+        if let error {
+            print("select error: \(error.localizedDescription)")
+            s.requestCloseSession()
+            done = true
+            return
+        }
         unit.measurementUnit = .inches
         print("--- unit geometry ---")
         print("unit.type:              \(unit.type.rawValue)")

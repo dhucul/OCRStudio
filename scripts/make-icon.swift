@@ -7,10 +7,30 @@ import ImageIO
 import UniformTypeIdentifiers
 import Foundation
 
-func drawIcon(_ s: CGFloat) -> CGImage {
-    let ctx = CGContext(data: nil, width: Int(s), height: Int(s), bitsPerComponent: 8,
-                        bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+enum IconError: LocalizedError {
+    case graphicsContext
+    case imageCreation
+    case destination(URL)
+    case finalization(URL)
+    case iconutil(Int32)
+
+    var errorDescription: String? {
+        switch self {
+        case .graphicsContext: return "Could not create the icon graphics context."
+        case .imageCreation: return "Could not render an icon image."
+        case .destination(let url): return "Could not create PNG destination at \(url.path)."
+        case .finalization(let url): return "Could not finish PNG at \(url.path)."
+        case .iconutil(let status): return "iconutil failed with status \(status)."
+        }
+    }
+}
+
+func drawIcon(_ s: CGFloat) throws -> CGImage {
+    guard let ctx = CGContext(
+        data: nil, width: Int(s), height: Int(s), bitsPerComponent: 8,
+        bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { throw IconError.graphicsContext }
 
     // Rounded-square ("squircle"-ish) background with a blue gradient.
     let inset = s * 0.05
@@ -81,37 +101,56 @@ func drawIcon(_ s: CGFloat) -> CGImage {
     bracket(CGPoint(x: o.maxX, y: o.minY), -1,  1)   // bottom-right
 
     ctx.restoreGState()
-    return ctx.makeImage()!
+    guard let image = ctx.makeImage() else { throw IconError.imageCreation }
+    return image
 }
 
-// Render the iconset.
-let outPath = CommandLine.arguments.count > 1
-    ? CommandLine.arguments[1]
-    : FileManager.default.currentDirectoryPath + "/Resources/AppIcon.icns"
+func main() throws {
+    let outURL = URL(fileURLWithPath: CommandLine.arguments.count > 1
+        ? CommandLine.arguments[1]
+        : FileManager.default.currentDirectoryPath + "/Resources/AppIcon.icns")
+    try FileManager.default.createDirectory(
+        at: outURL.deletingLastPathComponent(), withIntermediateDirectories: true
+    )
 
-let tmp = NSTemporaryDirectory() + "AppIcon.iconset"
-try? FileManager.default.removeItem(atPath: tmp)
-try! FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    let tmpURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("AppIcon-\(UUID().uuidString).iconset", isDirectory: true)
+    try FileManager.default.createDirectory(at: tmpURL, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tmpURL) }
 
-let variants: [(String, CGFloat)] = [
-    ("icon_16x16.png", 16), ("icon_16x16@2x.png", 32),
-    ("icon_32x32.png", 32), ("icon_32x32@2x.png", 64),
-    ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
-    ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
-    ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024),
-]
-for (name, size) in variants {
-    let img = drawIcon(size)
-    let url = URL(fileURLWithPath: tmp + "/" + name)
-    let dst = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)!
-    CGImageDestinationAddImage(dst, img, nil)
-    CGImageDestinationFinalize(dst)
+    let variants: [(String, CGFloat)] = [
+        ("icon_16x16.png", 16), ("icon_16x16@2x.png", 32),
+        ("icon_32x32.png", 32), ("icon_32x32@2x.png", 64),
+        ("icon_128x128.png", 128), ("icon_128x128@2x.png", 256),
+        ("icon_256x256.png", 256), ("icon_256x256@2x.png", 512),
+        ("icon_512x512.png", 512), ("icon_512x512@2x.png", 1024),
+    ]
+    for (name, size) in variants {
+        let image = try drawIcon(size)
+        let url = tmpURL.appendingPathComponent(name)
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL, UTType.png.identifier as CFString, 1, nil
+        ) else { throw IconError.destination(url) }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw IconError.finalization(url)
+        }
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+    process.arguments = ["-c", "icns", tmpURL.path, "-o", outURL.path]
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw IconError.iconutil(process.terminationStatus)
+    }
+    print("wrote \(outURL.path)")
 }
 
-let proc = Process()
-proc.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-proc.arguments = ["-c", "icns", tmp, "-o", outPath]
-try! proc.run()
-proc.waitUntilExit()
-try? FileManager.default.removeItem(atPath: tmp)
-print(proc.terminationStatus == 0 ? "wrote \(outPath)" : "iconutil failed (\(proc.terminationStatus))")
+do {
+    try main()
+} catch {
+    FileHandle.standardError.write(Data(("error: \(error.localizedDescription)\n").utf8))
+    exit(EXIT_FAILURE)
+}
