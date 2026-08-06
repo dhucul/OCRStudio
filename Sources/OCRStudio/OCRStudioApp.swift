@@ -11,6 +11,7 @@ struct OCRStudioApp: App {
                 .environment(model)
                 .frame(minWidth: 960, minHeight: 620)
                 .onAppear { model.startBrowsing() }
+                .onDisappear { model.shutDown() }
         }
         .commands {
             CommandGroup(replacing: .newItem) {

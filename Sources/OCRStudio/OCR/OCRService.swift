@@ -26,27 +26,27 @@ actor OCRService {
 
         // --- Text recognition ---
         let textRequest = VNRecognizeTextRequest()
-        textRequest.recognitionLevel = .accurate
-        textRequest.usesLanguageCorrection = true
-        if !options.languages.isEmpty {
-            textRequest.recognitionLanguages = options.languages
-        }
-        if #available(macOS 13.0, *) {
-            textRequest.automaticallyDetectsLanguage = options.automaticLanguageDetection
-        }
+        // Revision FIRST: it re-validates the revision-scoped language properties,
+        // so anything configured before it can be silently discarded.
         if let newest = VNRecognizeTextRequest.supportedRevisions.max() {
             textRequest.revision = newest
         }
-
-        var requests: [VNRequest] = [textRequest]
-
-        let barcodeRequest = VNDetectBarcodesRequest()
-        if options.detectBarcodes {
-            requests.append(barcodeRequest)
+        textRequest.recognitionLevel = .accurate
+        textRequest.usesLanguageCorrection = true
+        textRequest.automaticallyDetectsLanguage = options.automaticLanguageDetection
+        if !options.languages.isEmpty {
+            textRequest.recognitionLanguages = options.languages
         }
 
+        let barcodeRequest = VNDetectBarcodesRequest()
+
         let handler = VNImageRequestHandler(cgImage: cg, orientation: orientation, options: [:])
-        try handler.perform(requests)
+        // Perform separately: barcodes are the optional extra, and bundling them
+        // means one barcode failure throws away text that recognized fine.
+        try handler.perform([textRequest])
+        if options.detectBarcodes {
+            try? handler.perform([barcodeRequest])
+        }
 
         // --- Lines + per-word boxes ---
         var lines: [OCRLine] = []

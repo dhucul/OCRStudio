@@ -10,7 +10,12 @@ struct SettingsView: View {
             // OCR
             Form {
                 TextField("Languages (comma-separated)", text: languagesBinding)
-                    .help("BCP-47 codes in priority order, e.g. en-US, fr-FR")
+                    // Vision ignores the list when auto-detect is on, so don't
+                    // offer a field that silently does nothing.
+                    .disabled(model.settings.automaticLanguageDetection)
+                    .help(model.settings.automaticLanguageDetection
+                          ? "Turn off automatic detection to choose languages yourself"
+                          : "BCP-47 codes in priority order, e.g. en-US, fr-FR")
                 Toggle("Detect language automatically",
                        isOn: $model.settings.automaticLanguageDetection)
                 Toggle("Detect barcodes / QR codes", isOn: $model.settings.detectBarcodes)

@@ -15,8 +15,16 @@ final class PageVM: Identifiable {
     var cropToContent: Bool            // re-apply content crop on re-run (scanned pages)
 
     /// Recognized text — replaced whenever OCR (re)runs. Edits flow into editedText.
+    ///
+    /// Only tracks the new recognition when the user hasn't corrected the text.
+    /// The inspector promises those corrections drive the exports, so re-running
+    /// OCR must not silently discard them.
     var ocr: OCRPageResult? {
-        didSet { editedText = ocr?.fullText ?? "" }
+        didSet {
+            if editedText == (oldValue?.fullText ?? "") {
+                editedText = ocr?.fullText ?? ""
+            }
+        }
     }
     /// User-editable text shown/edited in the inspector and used by text exports.
     var editedText: String = ""
@@ -60,7 +68,7 @@ final class AppModel {
 
     var settings: Settings = .load() {
         didSet {
-            settings.save()
+            scheduleSettingsSave()
             if oldValue.watchFolder != settings.watchFolder, isWatching {
                 configureWatch(folder: settings.watchFolder)
             }
@@ -79,6 +87,9 @@ final class AppModel {
     @ObservationIgnored private let watcher = WatchFolderService()
     @ObservationIgnored private var watchRequestID = 0
     @ObservationIgnored private var watchConfigurationTask: Task<Void, Never>?
+    @ObservationIgnored private var settingsSaveTask: Task<Void, Never>?
+    /// The in-flight `runJob` task, retained so the user can cancel it.
+    @ObservationIgnored private var jobTask: Task<Void, Never>?
 
     var selectedPage: PageVM? { pages.first { $0.id == selectedPageID } }
     var hasPages: Bool { !pages.isEmpty }
@@ -103,15 +114,23 @@ final class AppModel {
         guard !urls.isEmpty, !isBusy else { return }
         runJob("Reading \(urls.count) file(s)…") { [settings] in
             var newPages: [PageVM] = []
+            var failed: [String] = []
             for url in urls {
-                let processed = try await self.jobs.process(url: url, settings: settings)
-                newPages.append(contentsOf: processed.map(PageVM.init))
+                try Task.checkCancellation()
+                // Keep what succeeded — one corrupt file shouldn't cost the user
+                // every other page in the selection.
+                do {
+                    let processed = try await self.jobs.process(url: url, settings: settings)
+                    newPages.append(contentsOf: processed.map(PageVM.init))
+                } catch {
+                    failed.append(url.lastPathComponent)
+                }
             }
-            await MainActor.run {
-                self.pages.append(contentsOf: newPages)
-                if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
-            }
+            self.pages.append(contentsOf: newPages)
+            if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
             return "Loaded \(newPages.count) page(s)"
+                + (failed.isEmpty ? ""
+                   : " · skipped \(failed.count): \(failed.joined(separator: ", "))")
         }
     }
 
@@ -125,27 +144,38 @@ final class AppModel {
         guard !snapshot.isEmpty else { return }
         runJob("Recognizing text…") { [settings] in
             var updates: [(PageVM.ID, ProcessedPage)] = []
+            var failed = 0
             for (id, original, dpi, name, crop) in snapshot {
-                let p = try await self.jobs.processImage(original, dpi: dpi, name: name,
-                                                         settings: settings,
-                                                         cropToContent: crop)
-                updates.append((id, p))
-            }
-            await MainActor.run {
-                for (id, p) in updates {
-                    if let page = self.pages.first(where: { $0.id == id }) {
-                        page.image = p.image    // keep boxes/overlay/PDF in sync with the new OCR
-                        page.ocr = p.ocr
-                    }
+                try Task.checkCancellation()
+                do {
+                    let p = try await self.jobs.processImage(original, dpi: dpi, name: name,
+                                                             settings: settings,
+                                                             cropToContent: crop)
+                    updates.append((id, p))
+                } catch {
+                    failed += 1   // leave that page's previous result intact
                 }
             }
-            return "OCR complete"
+            for (id, p) in updates {
+                if let page = self.pages.first(where: { $0.id == id }) {
+                    page.image = p.image    // keep boxes/overlay/PDF in sync with the new OCR
+                    page.ocr = p.ocr
+                }
+            }
+            return "OCR complete on \(updates.count) page(s)"
+                + (failed > 0 ? " · \(failed) failed" : "")
         }
     }
 
     // MARK: Scanning
 
     func startBrowsing() { scanner.startBrowsing() }
+
+    /// Release the ICA device browser — it polls the network for the whole
+    /// process lifetime otherwise.
+    func stopBrowsing() { scanner.stopBrowsing() }
+
+    func cancelScan() { scanner.cancel() }
 
     /// Epson's own scanning app, if installed (ScanSmart preferred — it scans
     /// straight to a file). Used as a fallback when macOS/ImageCaptureCore can't
@@ -192,10 +222,13 @@ final class AppModel {
             self.status = "Recognizing \(scannedURLs.count) scanned page(s)…"
             Task { [settings = self.settings] in
                 defer { self.removeScanFiles(scannedURLs) }
-                do {
-                    var newPages: [PageVM] = []
-                    var blanks = 0
-                    for url in scannedURLs {
+                var newPages: [PageVM] = []
+                var blanks = 0
+                var failed = 0
+                for url in scannedURLs {
+                    // Keep the sheets that processed — a single bad capture
+                    // shouldn't discard the rest of the feeder run.
+                    do {
                         let processed = try await self.jobs.process(
                             url: url, settings: settings,
                             cropToContent: settings.autoCropScannedPages)
@@ -206,14 +239,15 @@ final class AppModel {
                                 newPages.append(PageVM(page))
                             }
                         }
+                    } catch {
+                        failed += 1
                     }
-                    self.pages.append(contentsOf: newPages)
-                    if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
-                    self.status = "Scanned \(newPages.count) page(s)"
-                        + (blanks > 0 ? " · skipped \(blanks) blank" : "")
-                } catch {
-                    self.status = "Scan processing failed: \(error.localizedDescription)"
                 }
+                self.pages.append(contentsOf: newPages)
+                if self.selectedPageID == nil { self.selectedPageID = self.pages.first?.id }
+                self.status = "Scanned \(newPages.count) page(s)"
+                    + (blanks > 0 ? " · skipped \(blanks) blank" : "")
+                    + (failed > 0 ? " · \(failed) failed" : "")
                 self.isBusy = false
             }
         })
@@ -306,8 +340,8 @@ final class AppModel {
         guard let url = savePanel(suggested: "Document.docx", type: type) else { return }
         let pageText = editedPages
         runJob("Writing Word document…") {
-            let data = await Task.detached {
-                RichTextExport.wordData(from: pageText)
+            let data = try await Task.detached {
+                try RichTextExport.wordData(from: pageText)
             }.value
             try await Task.detached {
                 try data.write(to: url, options: .atomic)
@@ -396,6 +430,17 @@ final class AppModel {
         }
     }
 
+    /// Coalesce persistence: `settings` mutates once per keystroke in the Settings
+    /// window, and each write is a full JSON encode into `UserDefaults`.
+    private func scheduleSettingsSave() {
+        settingsSaveTask?.cancel()
+        settingsSaveTask = Task { [settings] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            settings.save()
+        }
+    }
+
     private func savePanel(suggested: String, type: UTType) -> URL? {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggested
@@ -411,14 +456,36 @@ final class AppModel {
         }
         isBusy = true
         status = startStatus
-        Task {
+        jobTask = Task {
             do {
                 let result = try await work()
                 self.status = result
+            } catch is CancellationError {
+                self.status = "Cancelled"
             } catch {
                 self.status = "Error: \(error.localizedDescription)"
             }
             self.isBusy = false
+            self.jobTask = nil
         }
+    }
+
+    /// Abort whatever is running — a long batch would otherwise lock every
+    /// control with no way out.
+    func cancelJob() {
+        if scanner.isScanning { scanner.cancel() }
+        jobTask?.cancel()
+    }
+
+    /// Tear down background work when the window goes away.
+    func shutDown() {
+        jobTask?.cancel()
+        settingsSaveTask?.cancel()
+        settings.save()          // flush any debounced write
+        watchConfigurationTask?.cancel()
+        scanner.cancel()
+        scanner.stopBrowsing()
+        let watcher = self.watcher
+        Task { await watcher.stop() }
     }
 }

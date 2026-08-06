@@ -64,6 +64,11 @@ final class ScannerService: NSObject, ObservableObject {
     private var onPage: ((URL) -> Void)?
     private var onComplete: ((Error?) -> Void)?
 
+    /// Fires if the device stops answering mid-handshake. Every exit from a scan
+    /// depends on a delegate callback, and a wedged/disconnected unit simply never
+    /// sends one — without this the job never completes and the UI stays busy forever.
+    private var watchdog: DispatchWorkItem?
+
     private let downloadsDir: URL
 
     override init() {
@@ -91,7 +96,17 @@ final class ScannerService: NSObject, ObservableObject {
     // MARK: Discovery
 
     func startBrowsing() {
+        // Never rebuild discovery under a running job — the active device would be
+        // dropped from the list while its delegate callbacks are still arriving.
+        guard !isScanning else { return }
         statusMessage = "Looking for scanners…"
+        // `start()` on an already-running browser is a no-op and re-announces
+        // nothing, so a refresh has to tear the discovery state down first —
+        // otherwise the button can never recover a stale list.
+        browser.stop()
+        devicesByID.removeAll()
+        deviceIDs.removeAll()
+        scanners.removeAll()
         browser.start()
     }
 
@@ -118,15 +133,39 @@ final class ScannerService: NSObject, ObservableObject {
 
         scanner.delegate = self
         statusMessage = "Opening scanner…"
+        armWatchdog()
         scanner.requestOpenSession()
     }
 
     func cancel() {
+        guard isScanning else { return }
+        statusMessage = "Cancelling…"
         activeScanner?.cancelScan()
+        // Don't trust a wedged device to report its own cancellation.
+        armWatchdog(Self.cancelTimeout)
+    }
+
+    // MARK: Watchdog
+
+    private static let handshakeTimeout: TimeInterval = 120
+    private static let cancelTimeout: TimeInterval = 5
+
+    /// (Re)arm the stall timer. Called at the start of a job and again on every
+    /// delegate callback that proves the device is still making progress.
+    private func armWatchdog(_ seconds: TimeInterval = ScannerService.handshakeTimeout) {
+        watchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.isScanning else { return }
+            self.finish(ScannerError.timedOut)
+        }
+        watchdog = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
     }
 
     private func finish(_ error: Error?) {
         guard isScanning else { return }
+        watchdog?.cancel()
+        watchdog = nil
         isScanning = false
         statusMessage = error == nil ? "Scan complete" : "Scan failed: \(error!.localizedDescription)"
         let completion = onComplete
@@ -213,13 +252,14 @@ final class ScannerService: NSObject, ObservableObject {
 }
 
 enum ScannerError: LocalizedError {
-    case busy, notFound, configuration, deviceError(String)
+    case busy, notFound, configuration, timedOut, deviceError(String)
 
     var errorDescription: String? {
         switch self {
         case .busy: return "A scan is already in progress."
         case .notFound: return "The selected scanner is no longer available."
         case .configuration: return "The scanner could not be configured."
+        case .timedOut: return "The scanner stopped responding."
         case .deviceError(let m): return m
         }
     }
@@ -263,7 +303,11 @@ extension ScannerService: ICScannerDeviceDelegate {
 
     // ICDeviceDelegate — required
     func didRemove(_ device: ICDevice) {
-        if device === activeScanner { finish(ScannerError.notFound) }
+        guard device === activeScanner else { return }
+        // The device is already torn down — clear it so `finish` doesn't try to
+        // close a session on it.
+        activeScanner = nil
+        finish(ScannerError.notFound)
     }
 
     func device(_ device: ICDevice, didEncounterError error: Error?) {
@@ -275,6 +319,7 @@ extension ScannerService: ICScannerDeviceDelegate {
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
         guard isScanning, device === activeScanner else { return }
         if let error { finish(error); return }
+        armWatchdog()   // progress
         // Otherwise wait for `scannerDeviceDidBecomeAvailable`.
     }
 
@@ -291,6 +336,7 @@ extension ScannerService: ICScannerDeviceDelegate {
     func scannerDeviceDidBecomeAvailable(_ scanner: ICScannerDevice) {
         guard isScanning, scanner === activeScanner else { return }
         guard let options = pendingOptions else { return }
+        armWatchdog()   // progress — the device is alive
 
         let available = scanner.availableFunctionalUnitTypes.compactMap {
             ICScannerFunctionalUnitType(rawValue: $0.uintValue)
@@ -310,11 +356,13 @@ extension ScannerService: ICScannerDeviceDelegate {
                        error: Error?) {
         guard isScanning, scanner === activeScanner else { return }
         if let error { finish(error); return }
+        armWatchdog()   // progress
         configureAndScan(scanner)
     }
 
     func scannerDevice(_ scanner: ICScannerDevice, didScanTo url: URL) {
         guard isScanning, scanner === activeScanner else { return }
+        armWatchdog()   // progress — a feeder may take minutes between pages
         onPage?(url)     // one call per page (e.g. each ADF / duplex side)
     }
 

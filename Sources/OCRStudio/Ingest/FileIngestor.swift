@@ -61,11 +61,21 @@ actor FileIngestor {
             let maxPixelSize = max(pixelWidth, pixelHeight)
             guard maxPixelSize > 0 else { continue }
 
-            // Decode at the source resolution while applying EXIF/TIFF orientation.
+            // Apply the same ceilings the PDF path uses. Decoding at native
+            // resolution makes an unbounded allocation from untrusted input — a
+            // 1200-dpi legal-size TIFF is ~660 MB before preprocessing copies it.
+            var targetMaxPixelSize = min(maxPixelSize, Int(Self.maximumDimension))
+            let sourcePixels = Double(pixelWidth) * Double(pixelHeight)
+            if sourcePixels > Self.maximumPixels {
+                let factor = (Self.maximumPixels / sourcePixels).squareRoot()
+                targetMaxPixelSize = max(1, Int(Double(targetMaxPixelSize) * factor))
+            }
+
+            // Decode at (or below) the source resolution, applying EXIF/TIFF orientation.
             let options: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+                kCGImageSourceThumbnailMaxPixelSize: targetMaxPixelSize
             ]
             guard let cg = CGImageSourceCreateThumbnailAtIndex(src, index, options as CFDictionary)
             else { continue }
@@ -76,9 +86,15 @@ actor FileIngestor {
             let verticalDPI = (props?[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue
             let candidates = [horizontalDPI, verticalDPI].compactMap { $0 }
                 .filter { $0.isFinite && $0 > 0 }
-            let imageDPI = candidates.isEmpty
+            let nominalDPI = candidates.isEmpty
                 ? 72.0
                 : candidates.reduce(0, +) / Double(candidates.count)
+
+            // If the decode was capped above, the pixels no longer represent the
+            // source DPI — scale it or the composed PDF comes out physically wrong.
+            let decodedScale = Double(max(cg.width, cg.height)) / Double(maxPixelSize)
+            let imageDPI = nominalDPI * (decodedScale.isFinite && decodedScale > 0
+                                         ? decodedScale : 1.0)
 
             pages.append(IngestedPage(image: SendableImage(cgImage: cg), dpi: imageDPI,
                                       existingText: "", existingLines: [],
@@ -95,6 +111,9 @@ actor FileIngestor {
         guard let doc = PDFDocument(url: url) else {
             throw PipelineError.unreadableFile(url)
         }
+        // A password-protected PDF loads fine but renders blank and yields no
+        // text — without this it silently produces a document of empty sheets.
+        guard !doc.isLocked else { throw PipelineError.lockedFile(url) }
         let scale = CGFloat(dpi) / 72.0
         var pages: [IngestedPage] = []
 
@@ -107,7 +126,9 @@ actor FileIngestor {
                   rawWidth > 0, rawHeight > 0,
                   rawWidth <= Self.maximumDimension, rawHeight <= Self.maximumDimension,
                   rawWidth * rawHeight <= Self.maximumPixels else {
-                throw PipelineError.oversizedPage(url, page: index + 1)
+                // Skip just this page — one poster-sized sheet shouldn't cost the
+                // caller the other 299. `ingest` still throws if none survive.
+                continue
             }
             let pixelWidth = Int(rawWidth.rounded())
             let pixelHeight = Int(rawHeight.rounded())

@@ -86,7 +86,7 @@ enum HeadlessCLI {
             do {
                 let sample = ["Linux_Commands", "systemctl --master-disable",
                               "This opening paragraph ends like a sentence."]
-                let data = RichTextExport.wordData(from: [sample.joined(separator: "\n")])
+                let data = try RichTextExport.wordData(from: [sample.joined(separator: "\n")])
                 try data.write(to: destination, options: .atomic)
                 print("wrote \(destination.path) (\(data.count) bytes)")
                 return EXIT_SUCCESS
@@ -140,12 +140,26 @@ enum HeadlessCLI {
     ) -> Int32 {
         let semaphore = DispatchSemaphore(value: 0)
         let result = ExitCodeBox()
-        Task {
+        Task.detached {
             result.set(await operation())
             semaphore.signal()
         }
-        semaphore.wait()
+        // Never park the main thread outright: `main.swift` is Swift 6 top-level
+        // code and therefore @MainActor, so a bare `wait()` deadlocks anything
+        // downstream that needs to hop back to the main actor.
+        while semaphore.wait(timeout: .now() + 0.05) == .timedOut {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
         return result.get()
+    }
+
+    /// Pump the main run loop briefly so in-flight ImageCaptureCore requests
+    /// (notably `requestCloseSession`) reach the device before `exit()`.
+    fileprivate static func drainRunLoop(_ seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        }
     }
 
     private static func run(inputs: [URL],
@@ -161,13 +175,22 @@ enum HeadlessCLI {
             let jobs = JobManager()
             let settings = Settings.load()
             var pages: [ProcessedPage] = []
+            var failed = 0
             for input in inputs {
-                let produced = try await jobs.process(
-                    url: input, settings: settings, cropToContent: cropToContent
-                )
-                pages.append(contentsOf: produced)
-                print("• \(input.lastPathComponent): \(produced.count) page(s)"
-                      + (cropToContent ? " [crop]" : ""))
+                // Keep what succeeded — one unreadable file shouldn't discard the
+                // pages already recognized from the rest of the batch.
+                do {
+                    let produced = try await jobs.process(
+                        url: input, settings: settings, cropToContent: cropToContent
+                    )
+                    pages.append(contentsOf: produced)
+                    print("• \(input.lastPathComponent): \(produced.count) page(s)"
+                          + (cropToContent ? " [crop]" : ""))
+                } catch {
+                    failed += 1
+                    writeError("• \(input.lastPathComponent): skipped — "
+                               + error.localizedDescription)
+                }
             }
             guard !pages.isEmpty else { throw CLIError.noPages }
 
@@ -186,7 +209,8 @@ enum HeadlessCLI {
 
             let preview = text.prefix(500)
             print("\n----- recognized text (first 500 chars) -----\n\(preview)\n----------------------------------------------")
-            return EXIT_SUCCESS
+            // Partial success is still a failure for scripting purposes.
+            return failed == 0 ? EXIT_SUCCESS : EXIT_FAILURE
         } catch {
             writeError("✗ Failed: \(error.localizedDescription)")
             return EXIT_FAILURE
@@ -222,6 +246,7 @@ final class ScannerLister: NSObject, ICDeviceBrowserDelegate {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25))
         }
         lister.browser.stop()
+        HeadlessCLI.drainRunLoop(1)
         print("\nDone — \(lister.count) scanner(s) found.")
         if lister.count == 0 {
             print("""
@@ -268,6 +293,9 @@ final class ScannerInspector: NSObject, ICDeviceBrowserDelegate, ICScannerDevice
         if !insp.done { print("Timed out — no scanner, or a session couldn't be opened from the CLI.") }
         insp.scanner?.requestCloseSession()
         insp.browser.stop()
+        // Let the close-session request actually reach the device — otherwise the
+        // process exits first and the scanner reports "busy" on the next run.
+        HeadlessCLI.drainRunLoop(2)
     }
 
     func deviceBrowser(_ b: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {

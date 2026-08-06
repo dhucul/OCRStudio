@@ -60,12 +60,17 @@ enum RichTextExport {
     }
 
     /// Word .docx with a real built-in Heading 1 style on each page's title line.
-    static func wordData(from pages: [String]) -> Data {
-        DocxWriter.data(pages: pages)
+    static func wordData(from pages: [String]) throws -> Data {
+        try DocxWriter.data(pages: pages)
     }
 
     /// Render the text into a paginated, selectable PDF (a text document — not the scan).
     static func writeTextPDF(pages: [String], to url: URL) throws {
+        guard !pages.isEmpty else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [
+                NSLocalizedDescriptionKey: "Cannot create a PDF with no pages."
+            ])
+        }
         let pageW: CGFloat = 612, pageH: CGFloat = 792, margin: CGFloat = 54
         let textRect = CGRect(x: margin, y: margin, width: pageW - 2 * margin, height: pageH - 2 * margin)
         var mediaBox = CGRect(x: 0, y: 0, width: pageW, height: pageH)
@@ -101,5 +106,6 @@ enum RichTextExport {
         }
 
         ctx.closePDF()
+        try PDFComposer.verifyWritten(url)
     }
 }

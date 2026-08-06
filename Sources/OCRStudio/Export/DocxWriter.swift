@@ -5,7 +5,15 @@ import Foundation
 /// parts and packages them with the minimal ZIP writer below — no dependencies.
 enum DocxWriter {
 
-    static func data(pages: [String]) -> Data {
+    enum DocxError: LocalizedError {
+        case tooLarge
+
+        var errorDescription: String? {
+            "The document is too large to package as a .docx (4 GB ZIP limit)."
+        }
+    }
+
+    static func data(pages: [String]) throws -> Data {
         var body = ""
         for (pageIndex, page) in pages.enumerated() {
             if pageIndex > 0 {
@@ -36,7 +44,8 @@ enum DocxWriter {
         zip.add("word/_rels/document.xml.rels", Self.documentRels)
         zip.add("word/document.xml", documentXML)
         zip.add("word/styles.xml", Self.stylesXML)
-        return zip.finish()
+        guard let data = zip.finish() else { throw DocxError.tooLarge }
+        return data
     }
 
     private static func escape(_ s: String) -> String {
@@ -90,6 +99,16 @@ struct ZipArchive {
 
     private var buffer = Data()
     private var entries: [Entry] = []
+    /// Set when an entry exceeds what ZIP32 can address. Every size/offset field
+    /// below is a narrowing conversion that would otherwise trap at runtime.
+    private var overflowed = false
+
+    /// 1980-01-01 00:00 in MS-DOS format. A literal 0 encodes day 0 of month 0,
+    /// which strict extractors flag as malformed.
+    private static let dosTime: UInt16 = 0
+    private static let dosDate: UInt16 = 0x0021
+
+    private static let maxSize = Int(UInt32.max)
 
     mutating func add(_ name: String, _ string: String) {
         add(name, Data(string.utf8))
@@ -100,11 +119,18 @@ struct ZipArchive {
         let offset = buffer.count
         let nameBytes = Array(name.utf8)
 
+        guard data.count <= Self.maxSize,
+              offset <= Self.maxSize,
+              nameBytes.count <= Int(UInt16.max) else {
+            overflowed = true
+            return
+        }
+
         buffer.append(le32(0x0403_4b50))           // local file header signature
         buffer.append(le16(20))                     // version needed
         buffer.append(le16(0))                      // flags
         buffer.append(le16(0))                      // method: stored
-        buffer.append(le16(0)); buffer.append(le16(0))   // mod time / date
+        buffer.append(le16(Self.dosTime)); buffer.append(le16(Self.dosDate))
         buffer.append(le32(crc))
         buffer.append(le32(UInt32(data.count)))     // compressed size
         buffer.append(le32(UInt32(data.count)))     // uncompressed size
@@ -116,14 +142,16 @@ struct ZipArchive {
         entries.append(Entry(name: nameBytes, crc: crc, size: data.count, offset: offset))
     }
 
-    mutating func finish() -> Data {
+    /// Returns nil when the archive exceeded ZIP32 limits.
+    mutating func finish() -> Data? {
+        guard !overflowed, entries.count <= Int(UInt16.max) else { return nil }
         let cdStart = buffer.count
         var cd = Data()
         for e in entries {
             cd.append(le32(0x0201_4b50))            // central directory signature
             cd.append(le16(20)); cd.append(le16(20))     // version made by / needed
             cd.append(le16(0)); cd.append(le16(0))       // flags / method
-            cd.append(le16(0)); cd.append(le16(0))       // time / date
+            cd.append(le16(Self.dosTime)); cd.append(le16(Self.dosDate))
             cd.append(le32(e.crc))
             cd.append(le32(UInt32(e.size)))         // compressed
             cd.append(le32(UInt32(e.size)))         // uncompressed
@@ -140,6 +168,7 @@ struct ZipArchive {
         buffer.append(le16(0)); buffer.append(le16(0))   // disk numbers
         buffer.append(le16(UInt16(entries.count)))
         buffer.append(le16(UInt16(entries.count)))
+        guard cd.count <= Self.maxSize, cdStart <= Self.maxSize else { return nil }
         buffer.append(le32(UInt32(cd.count)))
         buffer.append(le32(UInt32(cdStart)))
         buffer.append(le16(0))                      // comment length

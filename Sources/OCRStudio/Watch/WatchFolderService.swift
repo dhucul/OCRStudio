@@ -3,7 +3,9 @@ import Foundation
 /// Watches a folder and reports newly-added files once they are **stable**
 /// (size + mtime unchanged across two polls), so files still being copied in are
 /// not picked up mid-write. All mutable state is actor-isolated. The handler
-/// acknowledges success so failed work is retried rather than silently discarded.
+/// acknowledges success so failed work is retried rather than silently discarded;
+/// retries use exponential backoff, so a file that never succeeds stays eligible
+/// without re-running the pipeline on every poll.
 actor WatchFolderService {
 
     typealias FileHandler = @MainActor @Sendable (URL) async -> Bool
@@ -14,6 +16,24 @@ actor WatchFolderService {
     private var generation = UUID()
     private var lastSeen: [URL: FileStamp] = [:]
     private var processed: Set<URL> = []
+    /// Per-file retry schedule. Failed work stays eligible forever — a transient
+    /// problem (locked file, full disk, output folder temporarily unmounted) must
+    /// eventually clear — but the interval doubles after each failure so a file
+    /// that can *never* succeed costs a couple of attempts an hour instead of one
+    /// full OCR pass on every poll.
+    private var retries: [URL: RetryState] = [:]
+    private var pollInterval: TimeInterval = 2.0
+
+    private let clock = ContinuousClock()
+
+    /// Ceiling on the backoff interval. Monotonic, so a wall-clock jump (NTP,
+    /// waking from sleep) can't strand a file for hours.
+    private static let maxRetryDelay: Duration = .seconds(30 * 60)
+
+    private struct RetryState {
+        var attempts: Int
+        var readyAt: ContinuousClock.Instant
+    }
 
     private struct FileStamp: Equatable, Sendable {
         var size: Int64
@@ -43,8 +63,10 @@ actor WatchFolderService {
 
         stop()
         self.folder = folder
+        self.pollInterval = pollInterval
         lastSeen.removeAll()
         processed.removeAll()
+        retries.removeAll()
         try seedExisting(folder)
 
         let currentGeneration = generation
@@ -69,6 +91,16 @@ actor WatchFolderService {
         folder = nil
         lastSeen.removeAll()
         processed.removeAll()
+        retries.removeAll()
+    }
+
+    /// Delay before the *n*-th retry: doubles each time, capped.
+    private func retryDelay(afterAttempts attempts: Int) -> Duration {
+        let base = max(pollInterval, 0.05) * 2
+        // Clamp the exponent before it can overflow the multiplication.
+        let factor = pow(2.0, Double(min(attempts - 1, 24)))
+        let seconds = min(base * factor, Double(Self.maxRetryDelay.components.seconds))
+        return .seconds(seconds)
     }
 
     private func seedExisting(_ folder: URL) throws {
@@ -95,6 +127,7 @@ actor WatchFolderService {
         // again later, it is a new arrival and must be processed again.
         lastSeen = lastSeen.filter { currentSet.contains($0.key) }
         processed.formIntersection(currentSet)
+        retries = retries.filter { currentSet.contains($0.key) }
 
         for url in current {
             guard generation == expectedGeneration, !Task.isCancelled else { return }
@@ -102,18 +135,30 @@ actor WatchFolderService {
 
             guard let previous = lastSeen[url], previous == currentStamp else {
                 lastSeen[url] = currentStamp
+                // The bytes changed, so this is effectively a fresh arrival —
+                // don't make an edited file serve out the old file's backoff.
+                retries[url] = nil
                 continue
             }
 
-            // Stable across two polls. Await downstream completion before
-            // acknowledging it; failures remain eligible for retry.
+            // Stable across two polls, but a previous failure may still be
+            // serving its backoff interval.
+            if let retry = retries[url], clock.now < retry.readyAt { continue }
+
+            // Await downstream completion before acknowledging it; failures
+            // remain eligible for retry.
             guard let handler = onFile else { continue }
             let succeeded = await handler(url)
             guard generation == expectedGeneration, !Task.isCancelled else { return }
             if succeeded {
                 processed.insert(url)
+                retries[url] = nil
             } else {
-                lastSeen[url] = nil
+                let attempts = (retries[url]?.attempts ?? 0) + 1
+                retries[url] = RetryState(
+                    attempts: attempts,
+                    readyAt: clock.now.advanced(by: retryDelay(afterAttempts: attempts))
+                )
             }
         }
     }

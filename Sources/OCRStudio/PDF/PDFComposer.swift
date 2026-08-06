@@ -30,7 +30,10 @@ actor PDFComposer {
         }
 
         for page in pages {
-            let scale = CGFloat(72.0 / max(page.dpi, 1))
+            // `max(x, 1)` does NOT screen out NaN — every NaN comparison is false,
+            // so max() returns the NaN and it propagates into the media box.
+            let dpi = page.dpi.isFinite && page.dpi > 0 ? page.dpi : 72.0
+            let scale = CGFloat(72.0 / dpi)
             let pageW = CGFloat(page.image.width) * scale
             let pageH = CGFloat(page.image.height) * scale
             let box = CGRect(x: 0, y: 0, width: pageW, height: pageH)
@@ -59,6 +62,20 @@ actor PDFComposer {
         }
 
         ctx.closePDF()
+        try Self.verifyWritten(url)
+    }
+
+    /// `CGDataConsumer` accepts paths it can't actually write and reports nothing
+    /// on failure, so a read-only destination or a full disk would otherwise be
+    /// reported to the user as a successful save.
+    static func verifyWritten(_ url: URL) throws {
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size > 0 else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [
+                NSLocalizedDescriptionKey: "The PDF could not be written to \(url.path).",
+                NSFilePathErrorKey: url.path
+            ])
+        }
     }
 
     /// Draw one invisible word, scaled horizontally so its glyph advance matches

@@ -4,6 +4,7 @@ import CoreGraphics
 enum PipelineError: LocalizedError, Sendable {
     case unsupportedFile(URL)
     case unreadableFile(URL)
+    case lockedFile(URL)
     case unreadablePage(URL, page: Int)
     case noPages(URL)
     case invalidDPI(Double)
@@ -15,6 +16,8 @@ enum PipelineError: LocalizedError, Sendable {
             return "Unsupported file type: \(url.lastPathComponent)"
         case .unreadableFile(let url):
             return "Could not read \(url.lastPathComponent)."
+        case .lockedFile(let url):
+            return "\(url.lastPathComponent) is password-protected."
         case .unreadablePage(let url, let page):
             return "Could not render page \(page) of \(url.lastPathComponent)."
         case .noPages(let url):
@@ -113,7 +116,12 @@ actor JobManager {
         let textBoxes = result.lines
             .filter { $0.confidence >= 0.3 && $0.box.width > 0 && $0.box.height > 0 }
             .map(\.box)
-        let boxes = textBoxes + result.barcodes.map(\.box)
+        // Barcodes need the same degenerate-rect filter: Vision emits zero-size
+        // boxes for partial reads, and one of those drags the union to the origin
+        // and silently de-centers the crop.
+        let barcodeBoxes = result.barcodes.map(\.box)
+            .filter { $0.width > 0 && $0.height > 0 }
+        let boxes = textBoxes + barcodeBoxes
         guard let first = boxes.first else { return (image, result) }
 
         let w = CGFloat(image.width), h = CGFloat(image.height)
@@ -166,9 +174,16 @@ actor JobManager {
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         guard let data = ctx.data else { return 1.0 }
 
-        let ptr = data.bindMemory(to: UInt8.self, capacity: w * h)
+        // Read the stride back rather than assuming rows are exactly `w` bytes —
+        // CoreGraphics is free to pad them.
+        let stride = ctx.bytesPerRow
+        guard stride >= w else { return 1.0 }
+        let ptr = data.bindMemory(to: UInt8.self, capacity: stride * h)
         var dark = 0
-        for i in 0..<(w * h) where ptr[i] < 180 { dark += 1 }
+        for y in 0..<h {
+            let row = y * stride
+            for x in 0..<w where ptr[row + x] < 180 { dark += 1 }
+        }
         return Double(dark) / Double(w * h)
     }
 
@@ -209,9 +224,11 @@ actor JobManager {
         let pdfURL = dir.appendingPathComponent("\(base).pdf")
         try await writeSearchablePDF(pages, to: pdfURL)
 
+        // Best-effort: a failed sidecar must not invalidate a PDF that is already
+        // on disk, or the watch folder re-OCRs the whole file on every retry.
         let txt = Exporters.plainText(pages.map(\.ocr))
-        try txt.write(to: dir.appendingPathComponent("\(base).txt"),
-                      atomically: true, encoding: .utf8)
+        try? txt.write(to: dir.appendingPathComponent("\(base).txt"),
+                       atomically: true, encoding: .utf8)
         return pdfURL
     }
 }

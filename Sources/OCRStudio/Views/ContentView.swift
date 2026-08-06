@@ -75,6 +75,11 @@ struct ContentView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            if model.isBusy {
+                Button("Cancel") { model.cancelJob() }
+                    .buttonStyle(.link)
+                    .font(.callout)
+            }
             Spacer()
             Text("\(model.pages.count) page\(model.pages.count == 1 ? "" : "s")")
                 .font(.callout)
