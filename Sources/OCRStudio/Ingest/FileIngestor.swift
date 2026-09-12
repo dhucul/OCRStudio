@@ -18,145 +18,182 @@ struct IngestedPage: Sendable {
 /// layer already present in a PDF so callers can decide whether to re-OCR.
 actor FileIngestor {
 
-    private static let minimumDPI = 36.0
-    private static let maximumDPI = 1_200.0
-    private static let maximumDimension = 30_000.0
-    private static let maximumPixels = 150_000_000.0
-
     /// File types this ingestor understands.
     static let supportedExtensions: Set<String> = [
         "pdf", "png", "jpg", "jpeg", "tif", "tiff", "heic", "heif", "bmp", "gif"
     ]
 
-    func ingest(url: URL, dpi: Double) throws -> [IngestedPage] {
-        let ext = url.pathExtension.lowercased()
-        guard Self.supportedExtensions.contains(ext) else {
-            throw PipelineError.unsupportedFile(url)
-        }
-
-        let pages: [IngestedPage]
-        if ext == "pdf" {
-            pages = try ingestPDF(url: url, dpi: dpi)
-        } else {
-            pages = try ingestImages(url: url, includeAllFrames: ext == "tif" || ext == "tiff")
+    /// Compatibility helper for small callers. Production processing reads one
+    /// page at a time through a reader and reports individual failures.
+    func ingest(url: URL, dpi: Double) async throws -> [IngestedPage] {
+        let reader = try IngestReader(url: url, dpi: dpi)
+        var pages: [IngestedPage] = []
+        var remaining = RasterBudget.maximumBytes
+        for index in 0..<reader.pageCount {
+            let page = try await reader.readPage(at: index, maximumBytes: remaining)
+            remaining -= page.image.cgImage.bytesPerRow * page.image.height * 2
+            pages.append(page)
         }
         guard !pages.isEmpty else { throw PipelineError.noPages(url) }
         return pages
     }
+}
 
-    private func ingestImages(url: URL, includeAllFrames: Bool) throws -> [IngestedPage] {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            throw PipelineError.unreadableFile(url)
+/// Owns one source document and decodes only the requested page. No producer
+/// task or unbounded async-stream buffer can run ahead of the OCR consumer.
+actor IngestReader {
+    private let url: URL
+    private let dpi: Double
+    private let pdf: PDFDocument?
+    private let images: CGImageSource?
+    let pageCount: Int
+    private static let minimumDPI = 36.0
+    private static let maximumDPI = 1_200.0
+    private static let maximumDimension = 30_000.0
+    private static let maximumPixels = 150_000_000.0
+
+    init(url: URL, dpi: Double) throws {
+        try Task.checkCancellation()
+        self.url = url
+        self.dpi = dpi
+        let ext = url.pathExtension.lowercased()
+        guard FileIngestor.supportedExtensions.contains(ext) else {
+            throw PipelineError.unsupportedFile(url)
         }
-
-        let sourceCount = CGImageSourceGetCount(src)
-        let count = includeAllFrames ? sourceCount : min(sourceCount, 1)
-        var pages: [IngestedPage] = []
-        pages.reserveCapacity(count)
-
-        for index in 0..<count {
-            let props = CGImageSourceCopyPropertiesAtIndex(src, index, nil) as? [CFString: Any]
-            let pixelWidth = (props?[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
-            let pixelHeight = (props?[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
-            let maxPixelSize = max(pixelWidth, pixelHeight)
-            guard maxPixelSize > 0 else { continue }
-
-            // Apply the same ceilings the PDF path uses. Decoding at native
-            // resolution makes an unbounded allocation from untrusted input — a
-            // 1200-dpi legal-size TIFF is ~660 MB before preprocessing copies it.
-            var targetMaxPixelSize = min(maxPixelSize, Int(Self.maximumDimension))
-            let sourcePixels = Double(pixelWidth) * Double(pixelHeight)
-            if sourcePixels > Self.maximumPixels {
-                let factor = (Self.maximumPixels / sourcePixels).squareRoot()
-                targetMaxPixelSize = max(1, Int(Double(targetMaxPixelSize) * factor))
+        if ext == "pdf" {
+            guard dpi.isFinite, (Self.minimumDPI...Self.maximumDPI).contains(dpi) else {
+                throw PipelineError.invalidDPI(dpi)
             }
-
-            // Decode at (or below) the source resolution, applying EXIF/TIFF orientation.
-            let options: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: targetMaxPixelSize
-            ]
-            guard let cg = CGImageSourceCreateThumbnailAtIndex(src, index, options as CFDictionary)
-            else { continue }
-
-            // Use the image's real DPI (scanners write it) so the PDF is sized
-            // correctly; fall back to 72 if absent or malformed.
-            let horizontalDPI = (props?[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue
-            let verticalDPI = (props?[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue
-            let candidates = [horizontalDPI, verticalDPI].compactMap { $0 }
-                .filter { $0.isFinite && $0 > 0 }
-            let nominalDPI = candidates.isEmpty
-                ? 72.0
-                : candidates.reduce(0, +) / Double(candidates.count)
-
-            // If the decode was capped above, the pixels no longer represent the
-            // source DPI — scale it or the composed PDF comes out physically wrong.
-            let decodedScale = Double(max(cg.width, cg.height)) / Double(maxPixelSize)
-            let imageDPI = nominalDPI * (decodedScale.isFinite && decodedScale > 0
-                                         ? decodedScale : 1.0)
-
-            pages.append(IngestedPage(image: SendableImage(cgImage: cg), dpi: imageDPI,
-                                      existingText: "", existingLines: [],
-                                      hasTextLayer: false))
+            guard let doc = PDFDocument(url: url) else { throw PipelineError.unreadableFile(url) }
+            guard !doc.isLocked else { throw PipelineError.lockedFile(url) }
+            pdf = doc
+            images = nil
+            pageCount = doc.pageCount
+        } else {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+                throw PipelineError.unreadableFile(url)
+            }
+            pdf = nil
+            images = source
+            let count = CGImageSourceGetCount(source)
+            pageCount = (ext == "tif" || ext == "tiff") ? count : min(count, 1)
         }
-        guard !pages.isEmpty else { throw PipelineError.unreadableFile(url) }
-        return pages
+        guard pageCount > 0 else { throw PipelineError.noPages(url) }
     }
 
-    private func ingestPDF(url: URL, dpi: Double) throws -> [IngestedPage] {
-        guard dpi.isFinite, (Self.minimumDPI...Self.maximumDPI).contains(dpi) else {
-            throw PipelineError.invalidDPI(dpi)
+    func readPage(at index: Int, maximumBytes: Int = RasterBudget.maximumBytes) throws -> IngestedPage {
+        try Task.checkCancellation()
+        guard (0..<pageCount).contains(index) else {
+            throw PipelineError.unreadablePage(url, page: index + 1)
         }
-        guard let doc = PDFDocument(url: url) else {
-            throw PipelineError.unreadableFile(url)
+        let page: IngestedPage
+        if let pdf {
+            page = try ingestPDF(doc: pdf, index: index, maximumBytes: maximumBytes)
+        } else if let images {
+            page = try ingestImage(src: images, index: index, maximumBytes: maximumBytes)
+        } else { throw PipelineError.unreadableFile(url) }
+        try Task.checkCancellation()
+        return page
+    }
+
+    private func checkBudget(width: Double, height: Double, maximumBytes: Int) throws {
+        guard width * height * 8 <= Double(maximumBytes) else {
+            throw PipelineError.memoryLimit(url)
         }
-        // A password-protected PDF loads fine but renders blank and yields no
-        // text — without this it silently produces a document of empty sheets.
-        guard !doc.isLocked else { throw PipelineError.lockedFile(url) }
+    }
+
+    private func ingestImage(src: CGImageSource, index: Int, maximumBytes: Int) throws -> IngestedPage {
+        let props = CGImageSourceCopyPropertiesAtIndex(src, index, nil) as? [CFString: Any]
+        let pixelWidth = (props?[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
+        let pixelHeight = (props?[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+        let maxPixelSize = max(pixelWidth, pixelHeight)
+        guard pixelWidth > 0, pixelHeight > 0 else {
+            throw PipelineError.unreadablePage(url, page: index + 1)
+        }
+
+        // Apply the same ceilings the PDF path uses. Decoding at native
+        // resolution makes an unbounded allocation from untrusted input — a
+        // 1200-dpi legal-size TIFF is ~660 MB before preprocessing copies it.
+        var targetMaxPixelSize = min(maxPixelSize, Int(Self.maximumDimension))
+        let sourcePixels = Double(pixelWidth) * Double(pixelHeight)
+        if sourcePixels > Self.maximumPixels {
+            let factor = (Self.maximumPixels / sourcePixels).squareRoot()
+            targetMaxPixelSize = max(1, Int(Double(targetMaxPixelSize) * factor))
+        }
+
+        let decodedScaleEstimate = Double(targetMaxPixelSize) / Double(maxPixelSize)
+        try checkBudget(width: ceil(Double(pixelWidth) * decodedScaleEstimate),
+                        height: ceil(Double(pixelHeight) * decodedScaleEstimate),
+                        maximumBytes: maximumBytes)
+
+        // Decode at (or below) the source resolution, applying EXIF/TIFF orientation.
+        let options: [CFString: Any] = [
+            kCGImageSourceShouldCache: false,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: targetMaxPixelSize
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, index, options as CFDictionary)
+        else { throw PipelineError.unreadablePage(url, page: index + 1) }
+
+        // Use the image's real DPI (scanners write it) so the PDF is sized
+        // correctly; fall back to 72 if absent or malformed.
+        let horizontalDPI = (props?[kCGImagePropertyDPIWidth] as? NSNumber)?.doubleValue
+        let verticalDPI = (props?[kCGImagePropertyDPIHeight] as? NSNumber)?.doubleValue
+        let candidates = [horizontalDPI, verticalDPI].compactMap { $0 }
+            .filter { $0.isFinite && $0 > 0 }
+        let nominalDPI = candidates.isEmpty
+            ? 72.0
+            : candidates.reduce(0, +) / Double(candidates.count)
+
+        // If the decode was capped above, the pixels no longer represent the
+        // source DPI — scale it or the composed PDF comes out physically wrong.
+        let decodedScale = Double(max(cg.width, cg.height)) / Double(maxPixelSize)
+        let imageDPI = nominalDPI * (decodedScale.isFinite && decodedScale > 0
+                                     ? decodedScale : 1.0)
+
+        return IngestedPage(image: SendableImage(cgImage: cg), dpi: imageDPI,
+                            existingText: "", existingLines: [], hasTextLayer: false)
+    }
+
+    private func ingestPDF(doc: PDFDocument, index: Int, maximumBytes: Int) throws -> IngestedPage {
         let scale = CGFloat(dpi) / 72.0
-        var pages: [IngestedPage] = []
-
-        for index in 0..<doc.pageCount {
-            guard let page = doc.page(at: index) else { continue }
-            let bounds = page.bounds(for: .mediaBox)
-            let rawWidth = bounds.width * scale
-            let rawHeight = bounds.height * scale
-            guard rawWidth.isFinite, rawHeight.isFinite,
-                  rawWidth > 0, rawHeight > 0,
-                  rawWidth <= Self.maximumDimension, rawHeight <= Self.maximumDimension,
-                  rawWidth * rawHeight <= Self.maximumPixels else {
-                // Skip just this page — one poster-sized sheet shouldn't cost the
-                // caller the other 299. `ingest` still throws if none survive.
-                continue
-            }
-            let pixelWidth = Int(rawWidth.rounded())
-            let pixelHeight = Int(rawHeight.rounded())
-            guard pixelWidth > 0, pixelHeight > 0,
-                  let ctx = CGContext(data: nil, width: pixelWidth, height: pixelHeight,
-                                      bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
-            else { throw PipelineError.unreadablePage(url, page: index + 1) }
-
-            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
-            ctx.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-            ctx.scaleBy(x: scale, y: scale)
-            ctx.translateBy(x: -bounds.origin.x, y: -bounds.origin.y)
-            page.draw(with: .mediaBox, to: ctx)
-
-            guard let cg = ctx.makeImage() else {
-                throw PipelineError.unreadablePage(url, page: index + 1)
-            }
-            let text = (page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let lines = existingTextLines(on: page, pageBounds: bounds, scale: scale)
-            pages.append(IngestedPage(image: SendableImage(cgImage: cg),
-                                      dpi: dpi,
-                                      existingText: text,
-                                      existingLines: lines,
-                                      hasTextLayer: !text.isEmpty))
+        guard let page = doc.page(at: index) else {
+            throw PipelineError.unreadablePage(url, page: index + 1)
         }
-        return pages
+        let bounds = page.bounds(for: .mediaBox)
+        let rawWidth = bounds.width * scale
+        let rawHeight = bounds.height * scale
+        guard rawWidth.isFinite, rawHeight.isFinite,
+              rawWidth > 0, rawHeight > 0,
+              rawWidth <= Self.maximumDimension, rawHeight <= Self.maximumDimension,
+              rawWidth * rawHeight <= Self.maximumPixels else {
+            throw PipelineError.oversizedPage(url, page: index + 1)
+        }
+        try checkBudget(width: ceil(rawWidth), height: ceil(rawHeight), maximumBytes: maximumBytes)
+        let pixelWidth = Int(rawWidth.rounded())
+        let pixelHeight = Int(rawHeight.rounded())
+        guard pixelWidth > 0, pixelHeight > 0,
+              let ctx = CGContext(data: nil, width: pixelWidth, height: pixelHeight,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { throw PipelineError.unreadablePage(url, page: index + 1) }
+
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        ctx.scaleBy(x: scale, y: scale)
+        ctx.translateBy(x: -bounds.origin.x, y: -bounds.origin.y)
+        page.draw(with: .mediaBox, to: ctx)
+
+        guard let cg = ctx.makeImage() else {
+            throw PipelineError.unreadablePage(url, page: index + 1)
+        }
+        let text = (page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = existingTextLines(on: page, pageBounds: bounds, scale: scale)
+        return IngestedPage(image: SendableImage(cgImage: cg), dpi: dpi,
+                            existingText: text, existingLines: lines,
+                            hasTextLayer: !text.isEmpty)
     }
 
     /// Convert PDFKit's selectable line geometry (PDF points, bottom-left) into the

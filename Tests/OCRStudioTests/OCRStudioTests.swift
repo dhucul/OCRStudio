@@ -3,6 +3,7 @@ import CoreGraphics
 import CoreText
 import ImageIO
 import PDFKit
+import CoreImage
 import UniformTypeIdentifiers
 @testable import OCRStudio
 
@@ -344,7 +345,7 @@ final class OCRStudioTests: XCTestCase {
     }
 
     /// One poster-sized sheet shouldn't cost the caller every other page.
-    func testOversizedPageIsSkippedNotFatal() async throws {
+    func testOversizedPageIsReportedWhileReadablePagesSurvive() async throws {
         let source = temporaryURL(extension: "pdf")
         defer { try? FileManager.default.removeItem(at: source) }
 
@@ -353,15 +354,348 @@ final class OCRStudioTests: XCTestCase {
         let ctx = try XCTUnwrap(CGContext(consumer: consumer, mediaBox: &huge, nil))
         ctx.beginPDFPage(nil)                      // page 1: far over the pixel cap
         ctx.endPDFPage()
-        var normal = CGRect(x: 0, y: 0, width: 300, height: 200)
+        let normal = CGRect(x: 0, y: 0, width: 300, height: 200)
         ctx.beginPDFPage([kCGPDFContextMediaBox as String:
                           withUnsafeBytes(of: normal) { Data($0) } as CFData] as CFDictionary)
         ctx.endPDFPage()
         ctx.closePDF()
-        _ = normal
 
-        let pages = try await FileIngestor().ingest(url: source, dpi: 300)
-        XCTAssertEqual(pages.count, 1, "the oversized page is skipped, the normal one survives")
+        let report = try await JobManager().processReport(url: source, settings: Settings())
+        XCTAssertEqual(report.pages.count, 1)
+        XCTAssertEqual(report.failures.count, 1)
+        XCTAssertTrue(report.failures[0].contains("Page 1"))
+        do {
+            _ = try await JobManager().process(url: source, settings: Settings())
+            XCTFail("Strict callers must not acknowledge an incomplete document")
+        } catch PipelineError.incompleteDocument { }
+
+    }
+
+    func testCLIRejectsSidecarAsPDFAndInputAliases() throws {
+        let source = temporaryURL(extension: "pdf")
+        let alias = temporaryURL(extension: "pdf")
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: alias)
+        }
+        try makeTextPDF(at: source, text: "Source must survive")
+        for ext in ["txt", "json", "png", ""] {
+            XCTAssertThrowsError(try HeadlessCLI.validateOutput(source.deletingPathExtension()
+                .appendingPathExtension(ext), inputs: [source]))
+        }
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: source)
+        XCTAssertThrowsError(try HeadlessCLI.validateOutput(alias, inputs: [source]))
+        try FileManager.default.removeItem(at: alias)
+        try FileManager.default.linkItem(at: source, to: alias)
+        XCTAssertThrowsError(try HeadlessCLI.validateOutput(alias, inputs: [source]))
+        XCTAssertNoThrow(try HeadlessCLI.validateOutput(temporaryURL(extension: "pdf"), inputs: [source]))
+    }
+
+    func testWatchOutputNamesSeparateExtensionsAndDirectories() {
+        let directory = URL(fileURLWithPath: "/output")
+        let sources = ["/one/invoice.png", "/one/invoice.pdf", "/two/invoice.pdf"]
+        let outputs = sources.map { JobManager.outputURL(for: URL(fileURLWithPath: $0), directory: directory) }
+        XCTAssertEqual(Set(outputs).count, sources.count)
+        XCTAssertTrue(outputs.allSatisfy { $0.deletingPathExtension().lastPathComponent.hasSuffix("-ocr") })
+    }
+
+    func testAtomicFailurePreservesPreviousOutputAndRemovesTemporary() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let output = folder.appendingPathComponent("document.pdf")
+        let original = Data("previous complete document".utf8)
+        try original.write(to: output)
+        XCTAssertThrowsError(try AtomicFile.write(to: output) { temporary in
+            try Data("partial".utf8).write(to: temporary)
+            throw CocoaError(.fileWriteOutOfSpace)
+        })
+        XCTAssertEqual(try Data(contentsOf: output), original)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["document.pdf"])
+    }
+
+    func testPDFVerificationRejectsTruncatedAndWrongPageCount() throws {
+        let output = temporaryURL(extension: "pdf")
+        defer { try? FileManager.default.removeItem(at: output) }
+        try RichTextExport.writeTextPDF(pages: ["First", "Second"], to: output)
+        XCTAssertNoThrow(try PDFComposer.verifyWritten(output, expectedPages: 2))
+        XCTAssertThrowsError(try PDFComposer.verifyWritten(output, expectedPages: 3))
+        let data = try Data(contentsOf: output)
+        try data.prefix(data.count / 2).write(to: output)
+        XCTAssertThrowsError(try PDFComposer.verifyWritten(output))
+    }
+
+    func testCancellationReachesDetachedWriterBeforePublication() async throws {
+        let output = temporaryURL(extension: "txt")
+        defer { try? FileManager.default.removeItem(at: output) }
+        let original = Data("original".utf8)
+        try original.write(to: output)
+        let gate = WorkerGate()
+        let task = Task {
+            try await cancellableWork {
+                gate.arriveAndWait()
+                try AtomicFile.write(Data("replacement".utf8), to: output)
+            }
+        }
+        let began = await eventually { gate.hasArrived }
+        XCTAssertTrue(began)
+        task.cancel()
+        gate.release()
+        do { try await task.value; XCTFail("Expected cancellation") }
+        catch is CancellationError { }
+        XCTAssertEqual(try Data(contentsOf: output), original)
+    }
+
+    func testScannerCancellationBlocksEveryLaterHandshakeStep() {
+        for advance in 0...3 {
+            var flow = ScanLifecycle()
+            XCTAssertTrue(flow.start())
+            if advance >= 1 { XCTAssertTrue(flow.opened()) }
+            if advance >= 2 { XCTAssertTrue(flow.available()) }
+            if advance >= 3 { XCTAssertTrue(flow.selected()) }
+            XCTAssertTrue(flow.cancel())
+            XCTAssertFalse(flow.opened())
+            XCTAssertFalse(flow.available())
+            XCTAssertFalse(flow.selected())
+            XCTAssertEqual(flow.phase, .cancelling)
+            XCTAssertTrue(flow.close())
+            XCTAssertFalse(flow.start(), "Cannot reopen before closure")
+            flow.closed()
+            XCTAssertTrue(flow.start())
+        }
+    }
+
+    func testRasterBudgetReportsFailureBeforeDecodingNextPage() async throws {
+        let source = temporaryURL(extension: "pdf")
+        defer { try? FileManager.default.removeItem(at: source) }
+        try RichTextExport.writeTextPDF(pages: ["One", "Two"], to: source)
+        var settings = Settings()
+        settings.rasterDPI = 72
+        settings.enhanceContrast = false
+        settings.denoise = false
+        settings.detectBarcodes = false
+        settings.textLayerPolicy = .skip
+        // Enough for exactly one pair of 612 x 792 RGBA rasters, including stride padding.
+        let report = try await JobManager().processReport(url: source, settings: settings,
+                                                         maximumRetainedBytes: 4_000_000)
+        XCTAssertEqual(report.pages.count, 1)
+        XCTAssertEqual(report.failures.count, 1)
+        XCTAssertTrue(report.failures[0].contains("memory limit"))
+    }
+
+    func testContentCropPreservesUnrecognizedInkAndLowConfidenceBoxes() async throws {
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: 200, height: 300, bitsPerComponent: 8,
+                                          bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 200, height: 300))
+        ctx.setFillColor(CGColor(gray: 0.5, alpha: 1))
+        ctx.fill(CGRect(x: 50, y: 20, width: 60, height: 40)) // unrecognized figure
+        let source = SendableImage(cgImage: try XCTUnwrap(ctx.makeImage()))
+        let result = OCRPageResult(lines: [
+            OCRLine(text: "Title", box: CGRect(x: 40, y: 40, width: 80, height: 20), confidence: 1, words: []),
+            OCRLine(text: "Faint", box: CGRect(x: 25, y: 150, width: 10, height: 10), confidence: 0.1, words: [])
+        ], barcodes: [], imageWidth: 200, imageHeight: 300)
+        let (cropped, adjusted) = await JobManager().contentCropped(image: source, result: result)
+        XCTAssertLessThan(cropped.width, source.width)
+        XCTAssertEqual(try inkPixels(source.cgImage), try inkPixels(cropped.cgImage))
+        let bounds = CGRect(x: 0, y: 0, width: cropped.width, height: cropped.height)
+        XCTAssertTrue(adjusted.lines.allSatisfy { bounds.contains($0.box) })
+    }
+
+    func testDeskewOptionRefreshesExistingTextGeometry() async throws {
+        let source = temporaryURL(extension: "pdf")
+        defer { try? FileManager.default.removeItem(at: source) }
+        try makeTextPDF(at: source, text: "Fresh geometry after deskew")
+        var settings = Settings()
+        settings.textLayerPolicy = .skip
+        settings.autoCropDeskew = true
+        let pages = try await JobManager().process(url: source, settings: settings)
+        XCTAssertTrue(pages[0].ocr.fullText.contains("geometry"))
+        XCTAssertFalse(pages[0].ocr.lines.flatMap(\.words).isEmpty,
+                       "Fresh recognition must replace source PDF line geometry")
+    }
+
+    func testExistingTextStillDetectsQRCode() async throws {
+        let source = temporaryURL(extension: "pdf")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let filter = try XCTUnwrap(CIFilter(name: "CIQRCodeGenerator"))
+        filter.setValue(Data("ocrstudio-barcode".utf8), forKey: "inputMessage")
+        let qr = try XCTUnwrap(filter.outputImage).transformed(by: CGAffineTransform(scaleX: 5, y: 5))
+        let image = try XCTUnwrap(CIContext().createCGImage(qr, from: qr.extent))
+        var bounds = CGRect(x: 0, y: 0, width: 400, height: 400)
+        let consumer = try XCTUnwrap(CGDataConsumer(url: source as CFURL))
+        let ctx = try XCTUnwrap(CGContext(consumer: consumer, mediaBox: &bounds, nil))
+        ctx.beginPDFPage(nil)
+        ctx.draw(image, in: CGRect(x: 80, y: 40, width: 240, height: 240))
+        ctx.textPosition = CGPoint(x: 20, y: 350)
+        CTLineDraw(CTLineCreateWithAttributedString(NSAttributedString(string: "Existing document text", attributes: [
+            .font: CTFontCreateWithName("Helvetica" as CFString, 18, nil)
+        ])), ctx)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        var settings = Settings()
+        settings.textLayerPolicy = .skip
+        settings.enhanceContrast = false
+        settings.denoise = false
+        let pages = try await JobManager().process(url: source, settings: settings)
+        XCTAssertTrue(pages[0].ocr.barcodes.contains { $0.payload == "ocrstudio-barcode" })
+        XCTAssertTrue(pages[0].ocr.lines.allSatisfy { $0.words.isEmpty })
+    }
+
+    func testSidecarRetryDoesNotRewriteSuccessfulPDF() async throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("input.pdf")
+        try makeTextPDF(at: input, text: "Keep the successful PDF while retrying text")
+        let pdf = JobManager.outputURL(for: input, directory: folder)
+        let text = pdf.deletingPathExtension().appendingPathExtension("txt")
+        try FileManager.default.createDirectory(at: text, withIntermediateDirectories: false)
+        var settings = Settings()
+        settings.textLayerPolicy = .skip
+        settings.detectBarcodes = false
+        let manager = JobManager()
+        do { _ = try await manager.autoProcess(url: input, settings: settings); XCTFail("Sidecar failure must surface") }
+        catch { }
+        let writtenVersion = try FileVersion.read(pdf)
+        try FileManager.default.removeItem(at: text)
+        _ = try await manager.autoProcess(url: input, settings: settings)
+        XCTAssertEqual(try FileVersion.read(pdf), writtenVersion)
+        XCTAssertTrue(try String(contentsOf: text, encoding: .utf8).contains("successful PDF"))
+    }
+
+    func testWatcherReprocessesVersionChangedDuringHandler() async throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let recorder = AttemptRecorder(succeedAt: 1)
+        let gate = AsyncGate()
+        let watcher = WatchFolderService()
+        await watcher.setHandler { _ in
+            _ = await recorder.record()
+            if await recorder.count == 1 { await gate.wait() }
+            return true
+        }
+        try await watcher.start(folder: folder, pollInterval: 0.03)
+        let input = folder.appendingPathComponent("page.png")
+        try Data("first".utf8).write(to: input)
+        let began = await eventually { await recorder.count == 1 }
+        XCTAssertTrue(began)
+        try Data("replacement".utf8).write(to: input, options: .atomic)
+        await gate.release()
+        let repeated = await eventually { await recorder.count >= 2 }
+        XCTAssertTrue(repeated)
+        await watcher.stop()
+    }
+
+    func testWatcherRecognizesAtomicReplacementAfterSuccess() async throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let recorder = AttemptRecorder(succeedAt: 1)
+        let watcher = WatchFolderService()
+        await watcher.setHandler { _ in await recorder.record() }
+        try await watcher.start(folder: folder, pollInterval: 0.03)
+        let input = folder.appendingPathComponent("page.png")
+        try Data("first".utf8).write(to: input)
+        let began = await eventually { await recorder.count == 1 }
+        XCTAssertTrue(began)
+        let first = try FileVersion.read(input)
+        try Data("other".utf8).write(to: input, options: .atomic)
+        try FileManager.default.setAttributes([.modificationDate: first.modified], ofItemAtPath: input.path)
+        let repeated = await eventually { await recorder.count >= 2 }
+        XCTAssertTrue(repeated)
+        await watcher.stop()
+    }
+
+    func testStoppingWatcherCancelsHandlerPublication() async throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let recorder = AttemptRecorder(succeedAt: 1)
+        let gate = AsyncGate()
+        let watcher = WatchFolderService()
+        let output = folder.appendingPathComponent("result.txt")
+        await watcher.setHandler { _ in
+            _ = await recorder.record()
+            await gate.wait()
+            do { try AtomicFile.write(Data("late output".utf8), to: output) }
+            catch { }
+            _ = await recorder.record()
+            return true
+        }
+        try await watcher.start(folder: folder, pollInterval: 0.03)
+        try Data("source".utf8).write(to: folder.appendingPathComponent("page.png"))
+        let began = await eventually { await recorder.count == 1 }
+        XCTAssertTrue(began)
+        await watcher.stop()
+        await gate.release()
+        let ended = await eventually { await recorder.count == 2 }
+        XCTAssertTrue(ended)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    @MainActor
+    func testCancelledScanKeepsCapturesRecoverable() throws {
+        let source = temporaryURL(extension: "tiff")
+        defer { try? FileManager.default.removeItem(at: source) }
+        try Data("captured bytes".utf8).write(to: source)
+        let model = AppModel()
+        model.finishScan(captured: [source], error: CancellationError(), settings: Settings())
+        XCTAssertFalse(model.isBusy)
+        XCTAssertTrue(model.recoveryFiles.contains(source))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @MainActor
+    func testScannerFailureStillImportsSuccessfulCaptures() async throws {
+        let source = temporaryURL(extension: "pdf")
+        defer { try? FileManager.default.removeItem(at: source) }
+        try makeTextPDF(at: source, text: "Successful capture before feeder jam")
+        let model = AppModel()
+        var settings = Settings()
+        settings.textLayerPolicy = .skip
+        settings.autoCropScannedPages = false
+        settings.detectBarcodes = false
+        model.finishScan(captured: [source], error: ScannerError.timedOut, settings: settings)
+        for _ in 0..<200 where model.isBusy { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertEqual(model.pages.count, 1)
+        XCTAssertTrue(model.pages.first?.isScanned == true)
+        XCTAssertTrue(model.status.contains("Scanner stopped"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    @MainActor
+    func testRerunUsesCurrentScanCropPreference() async throws {
+        let model = AppModel()
+        model.settings.enhanceContrast = false
+        model.settings.denoise = false
+        model.settings.autoCropScannedPages = false
+        let image = SendableImage(cgImage: try solidImage(width: 100, height: 100))
+        let page = PageVM(originalImage: image, image: image, dpi: 72, sourceName: "scan",
+                          ocr: nil, cropToContent: true)
+        page.isScanned = true
+        model.pages = [page]
+        model.rerunOCR()
+        for _ in 0..<200 where model.isBusy { try await Task.sleep(for: .milliseconds(20)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(page.cropToContent)
+        XCTAssertTrue(page.isScanned)
+    }
+
+    private func temporaryFolder() throws -> URL {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    private func inkPixels(_ image: CGImage) throws -> Int {
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: image.width, height: image.height,
+                                          bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        let data = try XCTUnwrap(ctx.data).assumingMemoryBound(to: UInt8.self)
+        return (0..<image.height).reduce(0) { total, y in
+            total + (0..<image.width).filter { data[y * ctx.bytesPerRow + $0 * 4] < 200 }.count
+        }
     }
 
     private func eventually(
@@ -426,4 +760,28 @@ private actor AttemptRecorder {
         count += 1
         return count >= succeedAt
     }
+}
+
+private final class WorkerGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var arrived = false
+    private var released = false
+    var hasArrived: Bool { condition.lock(); defer { condition.unlock() }; return arrived }
+    func arriveAndWait() {
+        condition.lock()
+        arrived = true
+        while !released { condition.wait() }
+        condition.unlock()
+    }
+    func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+}
+
+private actor AsyncGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() { released = true; continuation?.resume(); continuation = nil }
 }

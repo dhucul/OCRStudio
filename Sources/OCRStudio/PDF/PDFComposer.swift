@@ -16,6 +16,13 @@ struct ComposablePage: Sendable {
 actor PDFComposer {
 
     func makeSearchablePDF(pages: [ComposablePage], to url: URL) throws {
+        try AtomicFile.write(to: url) { temporary in
+            try Self.render(pages: pages, to: temporary)
+        }
+    }
+
+    private static func render(pages: [ComposablePage], to url: URL) throws {
+        try Task.checkCancellation()
         guard !pages.isEmpty else {
             throw CocoaError(.fileWriteUnknown, userInfo: [
                 NSLocalizedDescriptionKey: "Cannot create a PDF with no pages."
@@ -29,7 +36,10 @@ actor PDFComposer {
             throw CocoaError(.fileWriteUnknown)
         }
 
+        var closed = false
+        defer { if !closed { ctx.closePDF() } }
         for page in pages {
+            try Task.checkCancellation()
             // `max(x, 1)` does NOT screen out NaN — every NaN comparison is false,
             // so max() returns the NaN and it propagates into the media box.
             let dpi = page.dpi.isFinite && page.dpi > 0 ? page.dpi : 72.0
@@ -62,25 +72,31 @@ actor PDFComposer {
         }
 
         ctx.closePDF()
-        try Self.verifyWritten(url)
+        closed = true
+        try Self.verifyWritten(url, expectedPages: pages.count)
     }
 
-    /// `CGDataConsumer` accepts paths it can't actually write and reports nothing
-    /// on failure, so a read-only destination or a full disk would otherwise be
-    /// reported to the user as a successful save.
-    static func verifyWritten(_ url: URL) throws {
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        guard size > 0 else {
+    /// Validate the complete temporary PDF, not a preexisting destination or a
+    /// nonempty prefix left by a failed writer.
+    static func verifyWritten(_ url: URL, expectedPages: Int? = nil) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        try handle.seek(toOffset: size > 1_024 ? size - 1_024 : 0)
+        let tail = try handle.readToEnd() ?? Data()
+        guard tail.range(of: Data("%%EOF".utf8)) != nil,
+              let document = CGPDFDocument(url as CFURL), document.numberOfPages > 0,
+              expectedPages == nil || document.numberOfPages == expectedPages,
+              (1...document.numberOfPages).allSatisfy({ document.page(at: $0) != nil }) else {
             throw CocoaError(.fileWriteUnknown, userInfo: [
-                NSLocalizedDescriptionKey: "The PDF could not be written to \(url.path).",
-                NSFilePathErrorKey: url.path
+                NSLocalizedDescriptionKey: "The completed PDF could not be validated at \(url.path)."
             ])
         }
     }
 
     /// Draw one invisible word, scaled horizontally so its glyph advance matches
     /// the OCR box width (keeps selection highlights aligned to the visible text).
-    private func drawInvisibleText(_ text: String,
+    private static func drawInvisibleText(_ text: String,
                                    pixelBox: CGRect,
                                    imageHeight: Int,
                                    scale: CGFloat,

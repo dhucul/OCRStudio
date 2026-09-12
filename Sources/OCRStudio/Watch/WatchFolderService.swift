@@ -1,8 +1,8 @@
 import Foundation
 
-/// Watches a folder and reports newly-added files once they are **stable**
-/// (size + mtime unchanged across two polls), so files still being copied in are
-/// not picked up mid-write. All mutable state is actor-isolated. The handler
+/// Reports new or changed file versions after identity, size and timestamps
+/// remain stable across two polls. Processing validates the version again before
+/// acknowledgment; the app handler also processes an immutable source copy. All mutable state is actor-isolated. The handler
 /// acknowledges success so failed work is retried rather than silently discarded;
 /// retries use exponential backoff, so a file that never succeeds stays eligible
 /// without re-running the pipeline on every poll.
@@ -14,8 +14,8 @@ actor WatchFolderService {
     private var pollTask: Task<Void, Never>?
     private var folder: URL?
     private var generation = UUID()
-    private var lastSeen: [URL: FileStamp] = [:]
-    private var processed: Set<URL> = []
+    private var lastSeen: [URL: FileVersion] = [:]
+    private var processed: [URL: FileVersion] = [:]
     /// Per-file retry schedule. Failed work stays eligible forever — a transient
     /// problem (locked file, full disk, output folder temporarily unmounted) must
     /// eventually clear — but the interval doubles after each failure so a file
@@ -35,11 +35,6 @@ actor WatchFolderService {
         var readyAt: ContinuousClock.Instant
     }
 
-    private struct FileStamp: Equatable, Sendable {
-        var size: Int64
-        var mtime: TimeInterval
-    }
-
     private static let skippedExtensions: Set<String> = [
         "tmp", "part", "crdownload", "download", "ds_store"
     ]
@@ -49,9 +44,9 @@ actor WatchFolderService {
     }
 
     func start(folder: URL, pollInterval: TimeInterval = 2.0) throws {
-        guard pollInterval.isFinite, pollInterval > 0 else {
+        guard pollInterval.isFinite, pollInterval > 0, pollInterval <= 3_600 else {
             throw CocoaError(.validationMissingMandatoryProperty, userInfo: [
-                NSLocalizedDescriptionKey: "The watch interval must be greater than zero."
+                NSLocalizedDescriptionKey: "The watch interval must be greater than zero and at most one hour."
             ])
         }
         let values = try folder.resourceValues(forKeys: [.isDirectoryKey, .isReadableKey])
@@ -107,7 +102,7 @@ actor WatchFolderService {
         for url in try contents(of: folder) {
             if let stamp = stamp(for: url) {
                 lastSeen[url] = stamp
-                processed.insert(url)   // ignore pre-existing files; only act on new ones
+                processed[url] = stamp // ignore this pre-existing version
             }
         }
     }
@@ -126,12 +121,14 @@ actor WatchFolderService {
         // Drop bookkeeping for files that disappeared. If the same path is created
         // again later, it is a new arrival and must be processed again.
         lastSeen = lastSeen.filter { currentSet.contains($0.key) }
-        processed.formIntersection(currentSet)
+        processed = processed.filter { currentSet.contains($0.key) }
         retries = retries.filter { currentSet.contains($0.key) }
 
         for url in current {
             guard generation == expectedGeneration, !Task.isCancelled else { return }
-            guard !processed.contains(url), let currentStamp = stamp(for: url) else { continue }
+            guard let currentStamp = stamp(for: url) else { continue }
+            guard processed[url] != currentStamp else { continue }
+            processed[url] = nil
 
             guard let previous = lastSeen[url], previous == currentStamp else {
                 lastSeen[url] = currentStamp
@@ -150,8 +147,13 @@ actor WatchFolderService {
             guard let handler = onFile else { continue }
             let succeeded = await handler(url)
             guard generation == expectedGeneration, !Task.isCancelled else { return }
+            guard let finishedStamp = stamp(for: url), finishedStamp == currentStamp else {
+                lastSeen[url] = stamp(for: url)
+                retries[url] = nil
+                continue
+            }
             if succeeded {
-                processed.insert(url)
+                processed[url] = currentStamp
                 retries[url] = nil
             } else {
                 let attempts = (retries[url]?.attempts ?? 0) + 1
@@ -185,14 +187,7 @@ actor WatchFolderService {
         }
     }
 
-    private func stamp(for url: URL) -> FileStamp? {
-        guard let values = try? url.resourceValues(
-            forKeys: [.fileSizeKey, .contentModificationDateKey]
-        ),
-        let size = values.fileSize,
-        let mtime = values.contentModificationDate?.timeIntervalSince1970 else {
-            return nil
-        }
-        return FileStamp(size: Int64(size), mtime: mtime)
+    private func stamp(for url: URL) -> FileVersion? {
+        try? FileVersion.read(url)
     }
 }

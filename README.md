@@ -25,7 +25,7 @@ Built entirely on system frameworks: **ImageCaptureCore** (scanning),
 - **Image preprocessing** to boost accuracy: enhance contrast, denoise,
   grayscale, and optional document auto-crop/deskew (Vision segmentation +
   Core Image perspective correction).
-- **Watch folder**: drop a file in, get a searchable PDF + text sidecar out.
+- **Watch folder**: drop a file in, get a searchable PDF + text sidecar out. Outputs include the source extension and a source-path digest to prevent name collisions.
 
 ## Requirements
 
@@ -110,15 +110,30 @@ OCR Studio's native scan can't see it either. Diagnose with:
 When macOS can't see the scanner, use the **Epson fallback** the app surfaces:
 press **Scan with Epson…** (launches Epson ScanSmart / Scan 2), save scans into a
 **Watch Folder** (Settings ▸ Output), and OCR Studio auto-OCRs each one into a
-searchable `…-ocr.pdf` + text sidecar.
+searchable `…-ocr.pdf` + text sidecar. Failed or cancelled native captures are retained in `~/Library/Application Support/OCRStudio/RecoveredScans`; use **Show Recoverable Scans** to reveal and reopen them.
 
 ## Notes & limitations
 
 - The live scanner path requires the Epson powered on and not held open by Epson
   Scan 2; it is driven via ImageCaptureCore and gated on the device becoming
   available.
-- The watch folder uses periodic polling with a size/mtime stability check
-  (robust against partial writes); it processes only files added after watching
-  starts.
+- The watch folder uses periodic polling with file identity, size and timestamp
+  stability checks. It ignores existing versions when watching starts, then
+  processes new and replaced/modified files. Changes during processing are retried.
+  A failed text sidecar is reported and retried without rewriting its successful
+  PDF while the app remains open.
+- Ingest decodes one page at a time. Retained original and prepared rasters share
+  a 256 MiB document budget, including earlier GUI imports and CLI inputs. Pages
+  that exceed the remaining budget are reported explicitly; lower PDF DPI or
+  split a large batch. Framework working buffers require additional memory.
+- Partial imports retain readable pages and report page-level failures. The CLI
+  exits nonzero on partial success; watch-folder jobs do not acknowledge incomplete
+  documents. `--out` must end in `.pdf`.
+- Automatic scan cropping preserves visible ink and all recognized boxes, including
+  figures, signatures and faint text. Noise or scanner-bed marks may therefore
+  prevent cropping. Geometric deskewing always refreshes text geometry through OCR.
+- PDF exports are validated before atomic replacement of the destination.
+  Cancellation is checked between processing stages/pages and before publication;
+  an active system-framework call may finish before cancellation takes effect.
 - For born-digital PDFs that already contain text, the default policy re-OCRs
   only when the existing text looks sparse (configurable in Settings).

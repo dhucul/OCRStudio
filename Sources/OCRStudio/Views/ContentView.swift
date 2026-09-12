@@ -55,8 +55,12 @@ struct ContentView: View {
             .disabled(!model.hasPages || model.isBusy)
 
             Button { model.toggleWatch() } label: {
-                Label(model.isWatching ? "Stop Watch" : "Watch Folder",
+                Label(model.watchRequested ? "Stop Watch" : "Watch Folder",
                       systemImage: model.isWatching ? "eye.fill" : "eye")
+            }
+
+            if !model.recoveryFiles.isEmpty {
+                Button("Show Recoverable Scans") { model.revealRecoverableScans() }
             }
 
             Button(role: .destructive) { model.clear() } label: {

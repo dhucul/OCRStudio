@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CryptoKit
 
 enum PipelineError: LocalizedError, Sendable {
     case unsupportedFile(URL)
@@ -9,6 +10,9 @@ enum PipelineError: LocalizedError, Sendable {
     case noPages(URL)
     case invalidDPI(Double)
     case oversizedPage(URL, page: Int)
+    case memoryLimit(URL)
+    case incompleteDocument([String])
+    case sourceChanged(URL)
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +28,12 @@ enum PipelineError: LocalizedError, Sendable {
             return "No readable pages were found in \(url.lastPathComponent)."
         case .invalidDPI(let dpi):
             return "Invalid PDF rasterization resolution: \(dpi)."
+        case .memoryLimit(let url):
+            return "Raster memory limit reached for \(url.lastPathComponent). Use a lower DPI or split the batch."
+        case .incompleteDocument(let failures):
+            return "Incomplete document: " + failures.joined(separator: "; ")
+        case .sourceChanged(let url):
+            return "\(url.lastPathComponent) changed during processing; waiting for a stable version."
         case .oversizedPage(let url, let page):
             return "Page \(page) of \(url.lastPathComponent) is too large to rasterize safely."
         }
@@ -40,18 +50,27 @@ struct ProcessedPage: Sendable {
     var dpi: Double
     var ocr: OCRPageResult
     var sourceName: String
-    var cropToContent: Bool = false   // whether this page should be content-cropped (scanned pages)
+    var cropToContent: Bool = false
+    var isScanned: Bool = false
+
+    var retainedBytes: Int {
+        image.cgImage.bytesPerRow * image.height + original.cgImage.bytesPerRow * original.height
+    }
 }
 
 /// Orchestrates the ingest → preprocess → OCR pipeline. Shared by the interactive
 /// "open files" path, batch processing, and the watch folder.
+struct ProcessingReport: Sendable {
+    var pages: [ProcessedPage] = []
+    var failures: [String] = []
+}
+
 actor JobManager {
 
     /// Suffix added to auto-generated outputs. Shared so the watch folder can skip
     /// its own products and avoid an OCR cascade.
     static let outputSuffix = "-ocr"
 
-    private let ingestor = FileIngestor()
     private let preprocessor = Preprocessor()
     private let ocr = OCRService()
     private let composer = PDFComposer()
@@ -62,16 +81,36 @@ actor JobManager {
     /// `cropToContent` trims empty margins (used for full-bed scans).
     func process(url: URL, settings: Settings,
                  cropToContent: Bool = false) async throws -> [ProcessedPage] {
-        let pages = try await ingestor.ingest(url: url, dpi: settings.rasterDPI)
-        let name = url.lastPathComponent
-        var out: [ProcessedPage] = []
-        out.reserveCapacity(pages.count)
-        for page in pages {
-            out.append(try await processPage(page, sourceName: name, settings: settings,
-                                             cropToContent: cropToContent))
+        let report = try await processReport(url: url, settings: settings, cropToContent: cropToContent)
+        guard report.failures.isEmpty else { throw PipelineError.incompleteDocument(report.failures) }
+        return report.pages
+    }
+
+    func processReport(url: URL, settings: Settings, cropToContent: Bool = false,
+                       isScanned: Bool = false,
+                       maximumRetainedBytes: Int = RasterBudget.maximumBytes) async throws -> ProcessingReport {
+        try Task.checkCancellation()
+        let reader = try IngestReader(url: url, dpi: settings.rasterDPI)
+        var report = ProcessingReport()
+        var remaining = max(0, maximumRetainedBytes)
+        for index in 0..<reader.pageCount {
+            try Task.checkCancellation()
+            do {
+                let page = try await reader.readPage(at: index, maximumBytes: remaining)
+                var processed = try await processPage(page, sourceName: url.lastPathComponent,
+                                                      settings: settings, cropToContent: cropToContent)
+                processed.isScanned = isScanned
+                guard processed.retainedBytes <= remaining else { throw PipelineError.memoryLimit(url) }
+                remaining -= processed.retainedBytes
+                report.pages.append(processed)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                report.failures.append("Page \(index + 1): \(error.localizedDescription)")
+            }
         }
-        guard !out.isEmpty else { throw PipelineError.noPages(url) }
-        return out
+        try Task.checkCancellation()
+        return report
     }
 
     /// Run a single in-memory image (e.g. a freshly scanned page) through the pipeline.
@@ -87,45 +126,41 @@ actor JobManager {
     private func processPage(_ page: IngestedPage, sourceName: String,
                              settings: Settings,
                              cropToContent: Bool) async throws -> ProcessedPage {
-        let prepared = await preprocessor.process(image: page.image,
+        try Task.checkCancellation()
+        let prepared = try await preprocessor.process(image: page.image,
                                                   options: settings.preprocessOptions)
         var result: OCRPageResult
-        if shouldOCR(page, policy: settings.textLayerPolicy) {
+        // Geometric preprocessing invalidates the source PDF's text boxes.
+        if settings.autoCropDeskew || shouldOCR(page, policy: settings.textLayerPolicy) {
             result = try await ocr.recognize(image: prepared, options: settings.ocrOptions)
         } else {
             result = resultFromExistingText(page.existingLines, image: prepared)
+            if settings.detectBarcodes {
+                result.barcodes = try await ocr.detectBarcodes(image: prepared)
+            }
         }
 
         var outImage = prepared
         if cropToContent {
             (outImage, result) = contentCropped(image: prepared, result: result)
         }
+        try Task.checkCancellation()
         return ProcessedPage(image: outImage, original: page.image,
                              dpi: page.dpi, ocr: result, sourceName: sourceName,
                              cropToContent: cropToContent)
     }
 
-    /// Trim a full-bed scan down to its content (the OCR text/barcode extent, plus a
-    /// margin) and shift the boxes to match, so the page is tight and centered.
-    /// No-ops when there's no text or the content already (nearly) fills the page.
-    private func contentCropped(image: SendableImage,
-                                result: OCRPageResult) -> (SendableImage, OCRPageResult) {
-        // Only confident text drives the crop bounds, so a stray low-confidence
-        // speck (edge mark, hole punch) can't blow up or de-center the crop. All
-        // recognized text is still kept in the result.
-        let textBoxes = result.lines
-            .filter { $0.confidence >= 0.3 && $0.box.width > 0 && $0.box.height > 0 }
-            .map(\.box)
-        // Barcodes need the same degenerate-rect filter: Vision emits zero-size
-        // boxes for partial reads, and one of those drags the union to the origin
-        // and silently de-centers the crop.
-        let barcodeBoxes = result.barcodes.map(\.box)
-            .filter { $0.width > 0 && $0.height > 0 }
-        let boxes = textBoxes + barcodeBoxes
-        guard let first = boxes.first else { return (image, result) }
-
+    /// Crop only empty near-white margins. Visual ink (including photographs,
+    /// signatures and faint marks) and every recognized box constrain the crop.
+    func contentCropped(image: SendableImage,
+                        result: OCRPageResult) -> (SendableImage, OCRPageResult) {
+        let textBoxes = result.lines.flatMap { [$0.box] + $0.words.map(\.box) }
+        let boxes = (textBoxes + result.barcodes.map(\.box))
+            .filter { !$0.isNull && $0.width > 0 && $0.height > 0 }
+        guard let ink = Self.visualContentBounds(image.cgImage) else { return (image, result) }
+        let first = ink
         let w = CGFloat(image.width), h = CGFloat(image.height)
-        let union = boxes.dropFirst().reduce(first) { $0.union($1) }
+        let union = boxes.reduce(first) { $0.union($1) }
         let crop = union
             .insetBy(dx: -w * 0.05, dy: -h * 0.05)   // even margin around the content
             .intersection(CGRect(x: 0, y: 0, width: w, height: h))
@@ -150,6 +185,30 @@ actor JobManager {
         let adjusted = OCRPageResult(lines: lines, barcodes: barcodes,
                                      imageWidth: cropped.width, imageHeight: cropped.height)
         return (SendableImage(cgImage: cropped), adjusted)
+    }
+
+    private static func visualContentBounds(_ image: CGImage) -> CGRect? {
+        let w = image.width, h = image.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let data = ctx.data else { return nil }
+        let bytes = data.assumingMemoryBound(to: UInt8.self)
+        var x0 = w, y0 = h, x1 = -1, y1 = -1
+        for y in 0..<h {
+            for x in 0..<w {
+                let offset = y * ctx.bytesPerRow + x * 4
+                if min(bytes[offset], bytes[offset + 1], bytes[offset + 2]) < 254 {
+                    x0 = min(x0, x); y0 = min(y0, y)
+                    x1 = max(x1, x); y1 = max(y1, y)
+                }
+            }
+        }
+        guard x1 >= x0, y1 >= y0 else { return nil }
+        return CGRect(x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1)
     }
 
     /// A page is blank when OCR found no text or barcodes AND it has almost no ink
@@ -212,23 +271,60 @@ actor JobManager {
         try await composer.makeSearchablePDF(pages: composable, to: url)
     }
 
-    /// Watch-folder entry point: process a dropped file and write a searchable PDF
-    /// plus a sidecar .txt next to it (or into `outputDir`). Returns the PDF URL.
+    private struct PendingSidecar {
+        let version: FileVersion
+        let text: Data
+        let pdfVersion: FileVersion
+    }
+    private var pendingSidecars: [URL: PendingSidecar] = [:]
+
+    /// Include the extension and a stable source-path digest, so distinct inputs
+    /// (including inputs in different folders) never share an output name.
+    static func outputURL(for source: URL, directory: URL) -> URL {
+        let path = source.resolvingSymlinksInPath().standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        let name = String(source.lastPathComponent.prefix(40))
+        return directory.appendingPathComponent("\(name)-\(digest)\(outputSuffix).pdf")
+    }
+
     @discardableResult
     func autoProcess(url: URL, settings: Settings) async throws -> URL {
-        let pages = try await process(url: url, settings: settings)
-        guard !pages.isEmpty else { throw PipelineError.noPages(url) }
+        try Task.checkCancellation()
+        let version = try FileVersion.read(url)
         let dir = settings.outputDirectory ?? url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let base = url.deletingPathExtension().lastPathComponent + Self.outputSuffix
-        let pdfURL = dir.appendingPathComponent("\(base).pdf")
-        try await writeSearchablePDF(pages, to: pdfURL)
+        let pdfURL = Self.outputURL(for: url, directory: dir)
+        let textURL = pdfURL.deletingPathExtension().appendingPathExtension("txt")
+        if let pending = pendingSidecars[pdfURL], pending.version == version,
+           (try? FileVersion.read(pdfURL)) == pending.pdfVersion {
+            try AtomicFile.write(pending.text, to: textURL)
+            pendingSidecars[pdfURL] = nil
+            return pdfURL
+        }
+        pendingSidecars[pdfURL] = nil
 
-        // Best-effort: a failed sidecar must not invalidate a PDF that is already
-        // on disk, or the watch folder re-OCRs the whole file on every retry.
-        let txt = Exporters.plainText(pages.map(\.ocr))
-        try? txt.write(to: dir.appendingPathComponent("\(base).txt"),
-                       atomically: true, encoding: .utf8)
+        // Process an immutable copy. A fresh metadata check before publishing
+        // prevents acknowledgment/output of a version superseded during OCR.
+        let snapshot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension(url.pathExtension)
+        let stagedPDF = dir.appendingPathComponent(".ocrstudio-\(UUID().uuidString).pdf")
+        defer {
+            try? FileManager.default.removeItem(at: snapshot)
+            try? FileManager.default.removeItem(at: stagedPDF)
+        }
+        try FileManager.default.copyItem(at: url, to: snapshot)
+        guard try FileVersion.read(url) == version else { throw PipelineError.sourceChanged(url) }
+        let pages = try await process(url: snapshot, settings: settings)
+        try await writeSearchablePDF(pages, to: stagedPDF)
+        guard try FileVersion.read(url) == version else { throw PipelineError.sourceChanged(url) }
+        try AtomicFile.write(to: pdfURL) { try FileManager.default.copyItem(at: stagedPDF, to: $0) }
+
+        let text = Data(Exporters.plainText(pages.map(\.ocr)).utf8)
+        pendingSidecars[pdfURL] = PendingSidecar(version: version, text: text,
+                                               pdfVersion: try FileVersion.read(pdfURL))
+        // Failure remains visible and retryable without rerunning OCR.
+        try AtomicFile.write(text, to: textURL)
+        pendingSidecars[pdfURL] = nil
         return pdfURL
     }
 }

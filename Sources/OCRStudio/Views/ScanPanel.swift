@@ -141,7 +141,7 @@ private struct ScanPanelInner: View {
             Button {
                 model.toggleWatch()
             } label: {
-                Label(model.isWatching ? "Stop Watching Folder" : "Start Watching Folder",
+                Label(model.watchRequested ? "Stop Watching Folder" : "Start Watching Folder",
                       systemImage: model.isWatching ? "eye.fill" : "eye")
                     .frame(maxWidth: .infinity)
             }

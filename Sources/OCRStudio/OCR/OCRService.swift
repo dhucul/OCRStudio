@@ -20,6 +20,7 @@ actor OCRService {
                    orientation: CGImagePropertyOrientation = .up,
                    options: OCROptions = OCROptions()) throws -> OCRPageResult {
 
+        try Task.checkCancellation()
         let cg = image.cgImage
         let width = cg.width
         let height = cg.height
@@ -44,6 +45,7 @@ actor OCRService {
         // Perform separately: barcodes are the optional extra, and bundling them
         // means one barcode failure throws away text that recognized fine.
         try handler.perform([textRequest])
+        try Task.checkCancellation()
         if options.detectBarcodes {
             try? handler.perform([barcodeRequest])
         }
@@ -84,7 +86,21 @@ actor OCRService {
             }
         }
 
+        try Task.checkCancellation()
         return OCRPageResult(lines: lines, barcodes: barcodes,
                              imageWidth: width, imageHeight: height)
     }
+    func detectBarcodes(image: SendableImage) throws -> [DetectedBarcode] {
+        try Task.checkCancellation()
+        let request = VNDetectBarcodesRequest()
+        let handler = VNImageRequestHandler(cgImage: image.cgImage, options: [:])
+        try? handler.perform([request]) // optional recognition; cancellation is not optional
+        try Task.checkCancellation()
+        return (request.results ?? []).map {
+            DetectedBarcode(payload: $0.payloadStringValue ?? "", symbology: $0.symbology.rawValue,
+                            box: Geometry.pixelRectTopLeft(fromNormalized: $0.boundingBox,
+                                                           width: image.width, height: image.height))
+        }
+    }
+
 }

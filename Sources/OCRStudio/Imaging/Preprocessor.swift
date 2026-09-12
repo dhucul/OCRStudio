@@ -18,7 +18,8 @@ actor Preprocessor {
 
     private let context = CIContext(options: [.useSoftwareRenderer: false])
 
-    func process(image: SendableImage, options: ImagePreprocessOptions) -> SendableImage {
+    func process(image: SendableImage, options: ImagePreprocessOptions) throws -> SendableImage {
+        try Task.checkCancellation()
         guard !options.isNoOp else { return image }
 
         var ci = CIImage(cgImage: image.cgImage)
@@ -48,6 +49,7 @@ actor Preprocessor {
               let out = context.createCGImage(ci, from: rect) else {
             return image
         }
+        try Task.checkCancellation()
         return SendableImage(cgImage: out)
     }
 

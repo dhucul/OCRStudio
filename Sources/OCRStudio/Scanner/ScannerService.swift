@@ -42,6 +42,32 @@ struct ScannerInfo: Identifiable, Hashable {
     let name: String
 }
 
+/// Explicit phases keep late callbacks from advancing a cancelled handshake.
+struct ScanLifecycle {
+    enum Phase { case idle, opening, waiting, selecting, scanning, cancelling, closing }
+    private(set) var phase: Phase = .idle
+    mutating func start() -> Bool { transition(from: .idle, to: .opening) }
+    mutating func opened() -> Bool { transition(from: .opening, to: .waiting) }
+    mutating func available() -> Bool { transition(from: .waiting, to: .selecting) }
+    mutating func selected() -> Bool { transition(from: .selecting, to: .scanning) }
+    mutating func cancel() -> Bool {
+        guard phase != .idle, phase != .closing, phase != .cancelling else { return false }
+        phase = .cancelling
+        return true
+    }
+    mutating func close() -> Bool {
+        guard phase != .idle, phase != .closing else { return false }
+        phase = .closing
+        return true
+    }
+    mutating func closed() { phase = .idle }
+    private mutating func transition(from: Phase, to: Phase) -> Bool {
+        guard phase == from else { return false }
+        phase = to
+        return true
+    }
+}
+
 /// Drives Epson (and any ICA-registered) scanners via ImageCaptureCore.
 ///
 /// ImageCaptureCore delivers its delegate callbacks on the main run loop and is
@@ -60,6 +86,11 @@ final class ScannerService: NSObject, ObservableObject {
 
     // Active job state
     private var activeScanner: ICScannerDevice?
+    private var lifecycle = ScanLifecycle()
+    private var completionError: Error?
+    private var unclosedScanners: Set<ObjectIdentifier> = []
+    private var watchdogID = UUID()
+    private var jobDirectory: URL?
     private var pendingOptions: ScanJobOptions?
     private var onPage: ((URL) -> Void)?
     private var onComplete: ((Error?) -> Void)?
@@ -71,9 +102,13 @@ final class ScannerService: NSObject, ObservableObject {
 
     private let downloadsDir: URL
 
+    static var recoveryDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OCRStudio/RecoveredScans", isDirectory: true)
+    }
+
     override init() {
-        downloadsDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OCRStudioScans", isDirectory: true)
+        downloadsDir = Self.recoveryDirectory
         super.init()
 
         browser.delegate = self
@@ -125,6 +160,12 @@ final class ScannerService: NSObject, ObservableObject {
         guard !isScanning else { onComplete(ScannerError.busy); return }
         guard let scanner = devicesByID[scannerID] else { onComplete(ScannerError.notFound); return }
 
+        guard !unclosedScanners.contains(ObjectIdentifier(scanner)) else {
+            onComplete(ScannerError.deviceError("The previous scanner session has not closed. Reconnect the scanner."))
+            return
+        }
+        guard lifecycle.start() else { onComplete(ScannerError.busy); return }
+        jobDirectory = downloadsDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
         self.activeScanner = scanner
         self.pendingOptions = options
         self.onPage = onPage
@@ -138,7 +179,7 @@ final class ScannerService: NSObject, ObservableObject {
     }
 
     func cancel() {
-        guard isScanning else { return }
+        guard lifecycle.cancel() else { return }
         statusMessage = "Cancelling…"
         activeScanner?.cancelScan()
         // Don't trust a wedged device to report its own cancellation.
@@ -154,39 +195,68 @@ final class ScannerService: NSObject, ObservableObject {
     /// delegate callback that proves the device is still making progress.
     private func armWatchdog(_ seconds: TimeInterval = ScannerService.handshakeTimeout) {
         watchdog?.cancel()
+        let id = UUID()
+        watchdogID = id
         let item = DispatchWorkItem { [weak self] in
-            guard let self, self.isScanning else { return }
-            self.finish(ScannerError.timedOut)
+            guard let self, self.isScanning, self.watchdogID == id else { return }
+            if self.lifecycle.phase == .closing {
+                if let scanner = self.activeScanner {
+                    self.unclosedScanners.insert(ObjectIdentifier(scanner))
+                }
+                self.completionError = self.completionError ?? ScannerError.timedOut
+                self.complete()
+            } else {
+                self.finish(self.lifecycle.phase == .cancelling ? CancellationError() : ScannerError.timedOut)
+            }
         }
         watchdog = item
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
     }
 
     private func finish(_ error: Error?) {
-        guard isScanning else { return }
+        let cancelled = lifecycle.phase == .cancelling
+        guard lifecycle.close() else { return }
+        completionError = cancelled ? CancellationError() : error
+        pendingOptions = nil
+        statusMessage = "Closing scanner…"
+        guard let scanner = activeScanner else { complete(); return }
+        armWatchdog(Self.cancelTimeout)
+        scanner.requestCloseSession()
+    }
+
+    /// Keep the job busy until closure is acknowledged or the device is quarantined.
+    private func complete() {
         watchdog?.cancel()
         watchdog = nil
+        watchdogID = UUID()
+        lifecycle.closed()
         isScanning = false
-        statusMessage = error == nil ? "Scan complete" : "Scan failed: \(error!.localizedDescription)"
+        let error = completionError
+        statusMessage = error == nil ? "Scan complete" : "Scan stopped: \(error!.localizedDescription)"
         let completion = onComplete
         onPage = nil
         onComplete = nil
         pendingOptions = nil
-        activeScanner?.requestCloseSession()
+        completionError = nil
         activeScanner = nil
+        if let directory = jobDirectory,
+           (try? FileManager.default.contentsOfDirectory(atPath: directory.path).isEmpty) == true {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        jobDirectory = nil
         completion?(error)
     }
 
     // MARK: Configuration once the unit is selected
 
     private func configureAndScan(_ scanner: ICScannerDevice) {
-        guard scanner === activeScanner else { return }
+        guard scanner === activeScanner, lifecycle.phase == .scanning else { return }
         guard let options = pendingOptions else {
             finish(ScannerError.configuration); return
         }
         do {
             try FileManager.default.createDirectory(
-                at: downloadsDir, withIntermediateDirectories: true
+                at: jobDirectory ?? downloadsDir, withIntermediateDirectories: true
             )
         } catch {
             finish(error)
@@ -218,7 +288,7 @@ final class ScannerService: NSObject, ObservableObject {
         }
 
         scanner.transferMode = .fileBased
-        scanner.downloadsDirectory = downloadsDir
+        scanner.downloadsDirectory = jobDirectory ?? downloadsDir
         scanner.documentName = "OCRStudioScan"
         scanner.documentUTI = UTType.tiff.identifier
 
@@ -307,7 +377,10 @@ extension ScannerService: ICScannerDeviceDelegate {
         // The device is already torn down — clear it so `finish` doesn't try to
         // close a session on it.
         activeScanner = nil
-        finish(ScannerError.notFound)
+        if lifecycle.phase == .closing {
+            completionError = completionError ?? ScannerError.notFound
+            complete()
+        } else { finish(ScannerError.notFound) }
     }
 
     func device(_ device: ICDevice, didEncounterError error: Error?) {
@@ -318,13 +391,22 @@ extension ScannerService: ICScannerDeviceDelegate {
     // ICDeviceDelegate — optional
     func device(_ device: ICDevice, didOpenSessionWithError error: Error?) {
         guard isScanning, device === activeScanner else { return }
+        if lifecycle.phase == .cancelling { finish(CancellationError()); return }
+        guard lifecycle.phase == .opening else { return }
         if let error { finish(error); return }
-        armWatchdog()   // progress
+        guard lifecycle.opened() else { return }
+        armWatchdog()
         // Otherwise wait for `scannerDeviceDidBecomeAvailable`.
     }
 
     func device(_ device: ICDevice, didCloseSessionWithError error: Error?) {
-        // Session closed; nothing further required.
+        if error == nil { unclosedScanners.remove(ObjectIdentifier(device)) }
+        guard device === activeScanner, lifecycle.phase == .closing else { return }
+        if let error {
+            unclosedScanners.insert(ObjectIdentifier(device))
+            completionError = completionError ?? error
+        }
+        complete()
     }
 
     func deviceDidBecomeReady(_ device: ICDevice) {
@@ -335,7 +417,7 @@ extension ScannerService: ICScannerDeviceDelegate {
     // ICScannerDeviceDelegate
     func scannerDeviceDidBecomeAvailable(_ scanner: ICScannerDevice) {
         guard isScanning, scanner === activeScanner else { return }
-        guard let options = pendingOptions else { return }
+        guard lifecycle.available(), let options = pendingOptions else { return }
         armWatchdog()   // progress — the device is alive
 
         let available = scanner.availableFunctionalUnitTypes.compactMap {
@@ -355,19 +437,23 @@ extension ScannerService: ICScannerDeviceDelegate {
                        didSelect functionalUnit: ICScannerFunctionalUnit,
                        error: Error?) {
         guard isScanning, scanner === activeScanner else { return }
+        guard lifecycle.phase == .selecting else { return }
         if let error { finish(error); return }
-        armWatchdog()   // progress
+        guard lifecycle.selected() else { return }
+        armWatchdog()
         configureAndScan(scanner)
     }
 
     func scannerDevice(_ scanner: ICScannerDevice, didScanTo url: URL) {
         guard isScanning, scanner === activeScanner else { return }
-        armWatchdog()   // progress — a feeder may take minutes between pages
+        guard lifecycle.phase == .scanning || lifecycle.phase == .cancelling else { return }
+        if lifecycle.phase == .scanning { armWatchdog() }
         onPage?(url)     // one call per page (e.g. each ADF / duplex side)
     }
 
     func scannerDevice(_ scanner: ICScannerDevice, didCompleteScanWithError error: Error?) {
         guard isScanning, scanner === activeScanner else { return }
+        guard lifecycle.phase == .scanning || lifecycle.phase == .cancelling else { return }
         finish(error)
     }
 }

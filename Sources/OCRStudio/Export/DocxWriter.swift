@@ -16,6 +16,7 @@ enum DocxWriter {
     static func data(pages: [String]) throws -> Data {
         var body = ""
         for (pageIndex, page) in pages.enumerated() {
+            try Task.checkCancellation()
             if pageIndex > 0 {
                 body += #"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#
             }
@@ -45,6 +46,7 @@ enum DocxWriter {
         zip.add("word/document.xml", documentXML)
         zip.add("word/styles.xml", Self.stylesXML)
         guard let data = zip.finish() else { throw DocxError.tooLarge }
+        try Task.checkCancellation()
         return data
     }
 

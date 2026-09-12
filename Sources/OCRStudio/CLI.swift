@@ -165,11 +165,8 @@ enum HeadlessCLI {
     private static func run(inputs: [URL],
                             output: URL,
                             cropToContent: Bool) async -> Int32 {
-        let normalizedOutput = output.standardizedFileURL
-        if inputs.map(\.standardizedFileURL).contains(normalizedOutput) {
-            writeError("✗ \(CLIError.outputMatchesInput(output).localizedDescription)")
-            return EXIT_FAILURE
-        }
+        do { try validateOutput(output, inputs: inputs) }
+        catch { writeError("✗ \(error.localizedDescription)"); return EXIT_FAILURE }
 
         do {
             let jobs = JobManager()
@@ -180,9 +177,15 @@ enum HeadlessCLI {
                 // Keep what succeeded — one unreadable file shouldn't discard the
                 // pages already recognized from the rest of the batch.
                 do {
-                    let produced = try await jobs.process(
-                        url: input, settings: settings, cropToContent: cropToContent
+                    let report = try await jobs.processReport(
+                        url: input, settings: settings, cropToContent: cropToContent,
+                        maximumRetainedBytes: RasterBudget.maximumBytes - pages.reduce(0) { $0 + $1.retainedBytes }
                     )
+                    let produced = report.pages
+                    if !report.failures.isEmpty {
+                        failed += 1
+                        writeError("• \(input.lastPathComponent): " + report.failures.joined(separator: "; "))
+                    }
                     pages.append(contentsOf: produced)
                     print("• \(input.lastPathComponent): \(produced.count) page(s)"
                           + (cropToContent ? " [crop]" : ""))
@@ -199,12 +202,12 @@ enum HeadlessCLI {
 
             let text = Exporters.plainText(pages.map(\.ocr))
             let textURL = output.deletingPathExtension().appendingPathExtension("txt")
-            try text.write(to: textURL, atomically: true, encoding: .utf8)
+            try AtomicFile.write(Data(text.utf8), to: textURL)
             print("✓ Text → \(textURL.path)")
 
             let json = try Exporters.json(pages.map(\.ocr))
             let jsonURL = output.deletingPathExtension().appendingPathExtension("json")
-            try json.write(to: jsonURL, options: .atomic)
+            try AtomicFile.write(json, to: jsonURL)
             print("✓ JSON → \(jsonURL.path)")
 
             let preview = text.prefix(500)
@@ -214,6 +217,27 @@ enum HeadlessCLI {
         } catch {
             writeError("✗ Failed: \(error.localizedDescription)")
             return EXIT_FAILURE
+        }
+    }
+
+    static func validateOutput(_ output: URL, inputs: [URL]) throws {
+        guard output.pathExtension.lowercased() == "pdf" else {
+            throw CocoaError(.fileWriteInvalidFileName, userInfo: [
+                NSLocalizedDescriptionKey: "--out must end in .pdf; .txt and .json sidecars are generated automatically."
+            ])
+        }
+        let outputs = [output, output.deletingPathExtension().appendingPathExtension("txt"),
+                       output.deletingPathExtension().appendingPathExtension("json")]
+        let inputPaths = Set(inputs.map { $0.resolvingSymlinksInPath().standardizedFileURL.path })
+        let inputVersions = inputs.compactMap { try? FileVersion.read($0) }
+        for destination in outputs {
+            let path = destination.resolvingSymlinksInPath().standardizedFileURL.path
+            let version = try? FileVersion.read(destination)
+            if inputPaths.contains(path) || version.map({ v in
+                inputVersions.contains { $0.inode == v.inode && $0.device == v.device }
+            }) == true {
+                throw CLIError.outputMatchesInput(destination)
+            }
         }
     }
 

@@ -66,6 +66,13 @@ enum RichTextExport {
 
     /// Render the text into a paginated, selectable PDF (a text document — not the scan).
     static func writeTextPDF(pages: [String], to url: URL) throws {
+        try AtomicFile.write(to: url) { temporary in
+            try renderTextPDF(pages: pages, to: temporary)
+        }
+    }
+
+    private static func renderTextPDF(pages: [String], to url: URL) throws {
+        try Task.checkCancellation()
         guard !pages.isEmpty else {
             throw CocoaError(.fileWriteUnknown, userInfo: [
                 NSLocalizedDescriptionKey: "Cannot create a PDF with no pages."
@@ -80,6 +87,9 @@ enum RichTextExport {
             throw CocoaError(.fileWriteUnknown)
         }
 
+        var closed = false
+        defer { if !closed { ctx.closePDF() } }
+        var emittedPages = 0
         let path = CGPath(rect: textRect, transform: nil)
         for page in pages {
             let attr = attributed(from: [page])
@@ -90,7 +100,9 @@ enum RichTextExport {
             // Every logical input page begins on a fresh PDF page. Long pages may
             // continue onto additional sheets, while an empty page still emits one.
             repeat {
+                try Task.checkCancellation()
                 ctx.beginPDFPage(nil)
+                emittedPages += 1
                 let frame = CTFramesetterCreateFrame(
                     framesetter,
                     CFRange(location: start, length: 0),
@@ -100,12 +112,16 @@ enum RichTextExport {
                 CTFrameDraw(frame, ctx)
                 let visible = CTFrameGetVisibleStringRange(frame)
                 ctx.endPDFPage()
-                if visible.length <= 0 { break }
+                if visible.length <= 0 {
+                    guard start >= total else { throw CocoaError(.fileWriteUnknown) }
+                    break
+                }
                 start += visible.length
             } while start < total
         }
 
         ctx.closePDF()
-        try PDFComposer.verifyWritten(url)
+        closed = true
+        try PDFComposer.verifyWritten(url, expectedPages: emittedPages)
     }
 }
