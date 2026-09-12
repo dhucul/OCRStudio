@@ -48,6 +48,16 @@ grant stick, create a stable signing identity once:
 ./scripts/create-signing-cert.sh    # optional; see the script header if it can't auto-create
 ```
 
+### Installers
+
+```bash
+./scripts/make-pkg.sh   # dist/OCR Studio.pkg: installs into /Applications
+./scripts/make-dmg.sh   # dist/OCR Studio.dmg: drag the app to Applications
+```
+
+The package installs `OCR Studio.app` into the system `/Applications` folder.
+It does not relocate installation to copies elsewhere on disk.
+
 ### Development build
 
 ```bash
